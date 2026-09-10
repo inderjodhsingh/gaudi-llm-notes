@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+title: "Gaudi LLM notes"
+message: "If you use these measurements or recipes, please cite this repository."
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/inderjodhsingh/gaudi-llm-notes"
+authors:
+  - name: "Gaudi LLM notes contributors"
+keywords:
+  - Gaudi2
+  - HPU
+  - vLLM
+  - decode
+  - Qwen

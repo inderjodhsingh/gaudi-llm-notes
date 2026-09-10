@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+AGENTS.md
+*.local.yaml
+*.local.json
+*.local.txt
+vault/
+*.pass
+*.pem
+*.key
+__pycache__/
+.venv/
+node_modules/
+*.log
