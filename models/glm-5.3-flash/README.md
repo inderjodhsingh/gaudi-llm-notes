@@ -8,9 +8,8 @@ Habana SynapseAI **1.24.1**, vision tower skipped (`--language-model-only`).
 Upstream vLLM ships this architecture as a **CUDA-only subpackage** (`vllm/models/glm5next/nvidia/`). Everything below
 runs on an out-of-tree port inside vllm-gaudi (see [RECIPE.md](RECIPE.md) → "Out-of-tree").
 
-Best single-stream greedy decode: **17.7 tok/s** (57 ms/token), and that figure is flat in context — 57.2 ms/token at
-4K and 57.2 ms/token at 190K. Throughput scales far better than single stream: **742 output tok/s at 128 concurrent**
-(4K context). Context verified to **196,608** tokens with needle retrieval 10/10 at 192K, both depths.
+Best single-stream greedy decode: **17.7 tok/s** (57 ms/token), and that figure is flat in context — 57.2 ms/token at 4K and 55.5 ms/token at 255K. Throughput scales far better than single stream: **742 output tok/s at 128 concurrent**
+(4K context). Context verified to **262,144** tokens with needle retrieval 10/10 at 256K, both depths.
 
 Copy-paste flags: [RECIPE.md](RECIPE.md).
 
@@ -79,8 +78,9 @@ Dense MLA (the serving default), needle retrieval = a 6-digit code inserted at a
 | 65,536 | 8 | 21 min | 64K in 11.8 s | 5/5 · 5/5 at 48K and 64K | 8 × 60K, 512 out: 129 tok/s steady state |
 | 131,072 | 8 | 26 min | 128K in 25.5 s | **10/10 · 10/10** at 96K and 128K | 8 × 90K, 256 out: 99–103 tok/s |
 | 196,608 | 2 | 28 min | 192K in 50.6 s | **10/10 · 10/10** at 192K | 190K in / 256 out: 57.2 ms TPOT at 1 stream, 153 ms at 2 |
+| 262,144 | 2 | 28 min | 256K in 74.9 s | **10/10 · 10/10** at 256K | 255K in / 256 out: 55.5 ms TPOT at 1 stream, 200 ms at 2 |
 
-The 192K row needs **chunked prefill**; the others do not. Serving headroom at 192K is 22.7 GiB per card.
+The 192K and 256K rows need **chunked prefill**; the others do not. Serving headroom is 22.7 GiB per card at 192K and 14.0 GiB at 256K.
 
 ### Prefill scaling
 
@@ -95,15 +95,17 @@ intercept:
 | 131,072 | 30.42 s | 0.232 | 21.7 % |
 | 163,840 | 40.13 s | 0.245 | 25.7 % |
 | 196,608 | 50.58 s | 0.257 | 29.4 % |
+| 262,144 | 74.87 s | 0.286 | 35.2 % |
 
-`a = 0.1818 ms/token` (95 % CI 0.1808–0.1827), `b = 0.3845 ns/token²` (0.3791–0.3900), residual RMS 0.018 s.
-**`b` is clearly non-zero** (t = 195), so prefill is measurably superlinear here — but the crossover where `bL²`
-overtakes `aL` is at **472,686 tokens**, about 2.5× the largest context this hardware warms up. Inside the served
+`a = 0.185 ms/token` (95 % CI 0.1843–0.1860), `b = 0.383 ns/token²` (0.3792–0.3869), residual RMS 0.019 s.
+**`b` is clearly non-zero** (t = 315), so prefill is measurably superlinear here — but the crossover where `bL²`
+overtakes `aL` is at **483,292 tokens**, about 1.8× the largest context this hardware warms up. Two independent
+fits, one ending at 192K and one at 256K, agree on `b` to 0.4 % and on the crossover to 2 %. Inside the served
 range the linear term dominates everywhere. Part of `b` is the chunking scheme rather than the attention kernel:
 each 8,192-token chunk attends to all preceding KV. An unchunked partial curve over 16K–64K gives `a = 0.168`,
 `b = 0.130` and a crossover near 1.3 M tokens.
 
-Decode does not scale with context at all: 57.2 ms/token at 4K and 57.2 ms/token at 190K. What grows is
+Decode does not scale with context at all: 57.2 ms/token at 4K, 57.2 ms at 190K, 55.5 ms at 255K. What grows is
 time-to-first-token.
 
 **What actually caps context: the KDA prefill working set.** `_kda_chunk_prefill` upcasts q/k/v/g/beta for the whole

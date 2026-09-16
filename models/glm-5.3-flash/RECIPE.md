@@ -1,4 +1,4 @@
-# Recipe — 742 output tok/s at 128 concurrent, 17.7 tok/s single stream, 192K context
+# Recipe — 742 output tok/s at 128 concurrent, 17.7 tok/s single stream, 256K context
 
 Checkpoint: `orcarouter/GLM-5.3-Flash-Uncensored-FP8` (fallback `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`)
 Hardware: 8× Intel Gaudi2 96 GB, TP=8 / EP=8. The weights are ~306 GB FP8, so all eight cards are needed.
@@ -63,10 +63,10 @@ Warmup ~26 min. Keep **chunked prefill on** above ~64K: it bounds the KDA prefil
 context ceiling is actually made of. Unchunked, a single 64K prefill reaches 92 GiB per card and a 192K warmup dies
 on a 1,536 MiB allocation inside `_kda_chunk_prefill`.
 
-## Maximum verified context — 192K, 2 sequences (needle 10/10 at 192K)
+## Maximum verified context — 256K, 2 sequences (needle 10/10 at 256K)
 
 ```bash
-export VLLM_DECODE_BLOCK_BUCKET_MAX=3072        # 2 seqs * 196608/128
+export VLLM_DECODE_BLOCK_BUCKET_MAX=4096        # 2 seqs * 262144/128
 
 python3 -m vllm.entrypoints.openai.api_server \
   --model /path/to/glm-5.3-flash \
@@ -74,16 +74,17 @@ python3 -m vllm.entrypoints.openai.api_server \
   --tensor-parallel-size 8 --enable-expert-parallel \
   --distributed-executor-backend mp \
   --dtype bfloat16 \
-  --max-model-len 196608 --max-num-seqs 2 \
+  --max-model-len 262144 --max-num-seqs 2 \
   --max-num-batched-tokens 8192 --enable-chunked-prefill \
-  --num-gpu-blocks-override 1100 --gpu-memory-utilization 0.9 \
+  --num-gpu-blocks-override 1500 --gpu-memory-utilization 0.9 \
   --no-enable-prefix-caching --language-model-only \
   --generation-config vllm --trust-remote-code
 ```
 
-Warmup 28 min, serving headroom 22.7 GiB per card, needle 10/10 at 192,000 tokens at both depths. Budget the
-time-to-first-token: a 192K prompt prefills in **50.6 s**. Decode is unaffected by context — 57.2 ms/token at one
-stream, the same as at 4K.
+Warmup 28 min, serving headroom 14.0 GiB per card, needle 10/10 at 256,000 tokens at both depths. Budget the
+time-to-first-token: a 256K prompt prefills in **74.9 s**. Decode is unaffected by context — 55.5 ms/token at one
+stream, the same as at 4K. For 192K instead, use `--max-model-len 196608 --num-gpu-blocks-override 1100` and
+`VLLM_DECODE_BLOCK_BUCKET_MAX=3072`: 50.6 s prefill and 22.7 GiB of headroom.
 
 Warm the prompt buckets **ascending** (smallest first) so that a run that runs out of memory still leaves a usable
 partial curve. Expect warmup to touch the allocator pool limit (96.9 GiB) and survive; that happens on every
