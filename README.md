@@ -8,6 +8,7 @@ Each model gets a folder under [`models/`](models/):
 |---|---|---|
 | [Qwen3.8-27B-Uncensored-FP8](models/qwen3.8-27b-fp8/) | [paper](models/qwen3.8-27b-fp8/README.md) · [recipe](models/qwen3.8-27b-fp8/RECIPE.md) | **~70–73 tok/s** (MTP k=1) |
 | [Qwen3.8-Flash-Next-Uncensored-FP8](models/qwen3.8-flash-next/) | [paper](models/qwen3.8-flash-next/README.md) · [recipe](models/qwen3.8-flash-next/RECIPE.md) | **~39 tok/s** (TP=4, 4× Gaudi2, MoE/GDN hybrid, out-of-tree port; 256K context verified) |
+| [GLM-5.3-Flash-Uncensored-FP8](models/glm-5.3-flash/) | [paper](models/glm-5.3-flash/README.md) · [recipe](models/glm-5.3-flash/RECIPE.md) | **~17.7 tok/s** (TP=8, 8× Gaudi2, MoE + KDA/DSA hybrid, out-of-tree port; 742 tok/s at 128 concurrent; 128K context verified) |
 | [Lightricks/LTX-2.5](models/ltx-2-5/) | [paper](models/ltx-2-5/README.md) · [recipe](models/ltx-2-5/RECIPE.md) | **~1.37 s/step** (distilled 8-step clip, not tok/s) |
 
 This is engineering documentation, not a vendor benchmark. Numbers are single-stream greedy (temperature 0) unless stated otherwise.
