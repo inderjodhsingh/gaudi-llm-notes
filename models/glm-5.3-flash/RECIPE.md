@@ -1,4 +1,4 @@
-# Recipe — 742 output tok/s at 128 concurrent, 17.7 tok/s single stream, 128K context
+# Recipe — 742 output tok/s at 128 concurrent, 17.7 tok/s single stream, 192K context
 
 Checkpoint: `orcarouter/GLM-5.3-Flash-Uncensored-FP8` (fallback `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`)
 Hardware: 8× Intel Gaudi2 96 GB, TP=8 / EP=8. The weights are ~306 GB FP8, so all eight cards are needed.
@@ -63,6 +63,32 @@ Warmup ~26 min. Keep **chunked prefill on** above ~64K: it bounds the KDA prefil
 context ceiling is actually made of. Unchunked, a single 64K prefill reaches 92 GiB per card and a 192K warmup dies
 on a 1,536 MiB allocation inside `_kda_chunk_prefill`.
 
+## Maximum verified context — 192K, 2 sequences (needle 10/10 at 192K)
+
+```bash
+export VLLM_DECODE_BLOCK_BUCKET_MAX=3072        # 2 seqs * 196608/128
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /path/to/glm-5.3-flash \
+  --served-model-name glm-5.3-flash \
+  --tensor-parallel-size 8 --enable-expert-parallel \
+  --distributed-executor-backend mp \
+  --dtype bfloat16 \
+  --max-model-len 196608 --max-num-seqs 2 \
+  --max-num-batched-tokens 8192 --enable-chunked-prefill \
+  --num-gpu-blocks-override 1100 --gpu-memory-utilization 0.9 \
+  --no-enable-prefix-caching --language-model-only \
+  --generation-config vllm --trust-remote-code
+```
+
+Warmup 28 min, serving headroom 22.7 GiB per card, needle 10/10 at 192,000 tokens at both depths. Budget the
+time-to-first-token: a 192K prompt prefills in **50.6 s**. Decode is unaffected by context — 57.2 ms/token at one
+stream, the same as at 4K.
+
+Warm the prompt buckets **ascending** (smallest first) so that a run that runs out of memory still leaves a usable
+partial curve. Expect warmup to touch the allocator pool limit (96.9 GiB) and survive; that happens on every
+configuration here, including 32K, and is not by itself a failure.
+
 ## Tool calling and reasoning
 
 ```bash
@@ -119,7 +145,7 @@ What the port covers, in rough order of importance:
 | `VLLM_DECODE_BLOCK_BUCKET_MAX` below `max_seqs × ceil(len/128)` | a new graph compiles every step; host OOM mid-run |
 | `--speculative-config '{"method":"mtp",...}'` | rejected at config time, and three more blockers behind that |
 | `--enable-prefix-caching` with `--no-enable-chunked-prefill` | assertion: mamba `align` cache mode requires chunked prefill |
-| Unchunked prefill above ~64K | the KDA fp32 whole-prompt working set exhausts the allocator |
+| Unchunked prefill above ~64K | the KDA fp32 whole-prompt working set exhausts the allocator (192K warmup dies; 160K breaches the floor at a 64K prefill) |
 | Trusting vLLM dataclass config defaults | they disagree with the checkpoint (`num_experts_per_token`, `first_k_dense_replace`); load the local HF config |
 | Passing a repo id instead of a local directory | the processor joins paths against the model dir |
 | Comparing greedy output across concurrent requests | temperature 0 is only reproducible at concurrency 1 |

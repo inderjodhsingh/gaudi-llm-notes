@@ -8,9 +8,9 @@ Habana SynapseAI **1.24.1**, vision tower skipped (`--language-model-only`).
 Upstream vLLM ships this architecture as a **CUDA-only subpackage** (`vllm/models/glm5next/nvidia/`). Everything below
 runs on an out-of-tree port inside vllm-gaudi (see [RECIPE.md](RECIPE.md) → "Out-of-tree").
 
-Best single-stream greedy decode: **17.7 tok/s** (57 ms/token) at 4K context, **~18 tok/s** at 60K context.
-Throughput scales far better than single stream: **742 output tok/s at 128 concurrent** (4K context). Context verified
-to **131,072** tokens with needle retrieval 10/10 at both 96K and 128K.
+Best single-stream greedy decode: **17.7 tok/s** (57 ms/token), and that figure is flat in context — 57.2 ms/token at
+4K and 57.2 ms/token at 190K. Throughput scales far better than single stream: **742 output tok/s at 128 concurrent**
+(4K context). Context verified to **196,608** tokens with needle retrieval 10/10 at 192K, both depths.
 
 Copy-paste flags: [RECIPE.md](RECIPE.md).
 
@@ -78,22 +78,47 @@ Dense MLA (the serving default), needle retrieval = a 6-digit code inserted at a
 | 32,768 | 8 | 19 min | 32K in 5.9 s | 5/5 · 5/5 at 8K, 16K, 32K | 8K ctx, 1K out: 115 tok/s, TPOT 61 ms |
 | 65,536 | 8 | 21 min | 64K in 11.8 s | 5/5 · 5/5 at 48K and 64K | 8 × 60K, 512 out: 129 tok/s steady state |
 | 131,072 | 8 | 26 min | 128K in 25.5 s | **10/10 · 10/10** at 96K and 128K | 8 × 90K, 256 out: 99–103 tok/s |
+| 196,608 | 2 | 28 min | 192K in 50.6 s | **10/10 · 10/10** at 192K | 190K in / 256 out: 57.2 ms TPOT at 1 stream, 153 ms at 2 |
 
-Prefill is **linear** in this range. Fitting `t(L) = aL + bL²` over 16K–64K gives `a = 0.168 ms/token` and a quadratic
-term whose share is 1.3 % at 16K and 4.8 % at 64K; the crossover where `bL²` overtakes `aL` sits near 1.3 M tokens,
-far past anything this hardware serves. So attention is not what limits context here — memory is.
+The 192K row needs **chunked prefill**; the others do not. Serving headroom at 192K is 22.7 GiB per card.
 
-**What actually caps context: the KDA chunked-prefill working set.** `_kda_chunk_prefill` upcasts q/k/v/g/beta for the
-whole prompt to fp32 and holds roughly nine tensors of shape `[S, heads, chunks, C, D]` live at once, all linear in
-prompt length. A 192K warmup dies on a single **1,536 MiB** device allocation inside it
-(`PT_DEVMEM Allocation failed for size::1610612736`), and an unchunked 160K serve reaches **91.9 GiB** in use on a
-mere 64K prefill. Chunked prefill bounds it to the chunk, which is why the 128K configuration sits at 68 GiB with
-28 GiB of headroom. The fix direction is to keep the per-group loop without concatenating the intra-chunk attention,
-and to avoid whole-prompt fp32 copies.
+### Prefill scaling
 
-Warmup has a separate memory phenomenon: on **every** configuration measured, including the known-good 32K one, some
-ranks reach the allocator pool limit (96.9 GiB) during warmup while serving afterwards peaks 30 GB lower. Cause
-unknown. Judge warmup by whether it completes, and enforce a headroom floor only during serving.
+Six points, one request at a time, three timed runs each (repeat spread ≤ 0.054 s), fitting `t(L) = aL + bL²` with no
+intercept:
+
+| L | prefill | s per 1k tokens | quadratic share |
+|---|---|---|---|
+| 16,384 | 3.10 s | 0.189 | 3.4 % |
+| 32,768 | 6.35 s | 0.194 | 6.5 % |
+| 65,536 | 13.56 s | 0.207 | 12.2 % |
+| 131,072 | 30.42 s | 0.232 | 21.7 % |
+| 163,840 | 40.13 s | 0.245 | 25.7 % |
+| 196,608 | 50.58 s | 0.257 | 29.4 % |
+
+`a = 0.1818 ms/token` (95 % CI 0.1808–0.1827), `b = 0.3845 ns/token²` (0.3791–0.3900), residual RMS 0.018 s.
+**`b` is clearly non-zero** (t = 195), so prefill is measurably superlinear here — but the crossover where `bL²`
+overtakes `aL` is at **472,686 tokens**, about 2.5× the largest context this hardware warms up. Inside the served
+range the linear term dominates everywhere. Part of `b` is the chunking scheme rather than the attention kernel:
+each 8,192-token chunk attends to all preceding KV. An unchunked partial curve over 16K–64K gives `a = 0.168`,
+`b = 0.130` and a crossover near 1.3 M tokens.
+
+Decode does not scale with context at all: 57.2 ms/token at 4K and 57.2 ms/token at 190K. What grows is
+time-to-first-token.
+
+**What actually caps context: the KDA prefill working set.** `_kda_chunk_prefill` upcasts q/k/v/g/beta for the whole
+prompt to fp32 and holds roughly nine tensors of shape `[S, heads, chunks, C, D]` live at once, plus a
+`torch.cat`-ed intra-chunk attention across all chunks — all linear in prompt length. Unchunked, a 192K warmup dies on
+a single **1,536 MiB** device allocation inside it (`PT_DEVMEM Allocation failed for size::1610612736`,
+`hpu_kda_pytorch.py:257`), and a 160K serve reaches **91.9 GiB** in use on a mere 64K prefill. Chunked prefill bounds
+it to one chunk, which is the whole reason 192K serves at 22.7 GiB of headroom and 128K sits at 68 GiB. The fix
+direction is to keep the per-group loop without concatenating the intra-chunk attention, and to drop the whole-prompt
+fp32 copies.
+
+Warmup memory is a separate phenomenon and it is not cosmetic: on **every** configuration measured, including the
+known-good 32K one, some ranks reach the allocator pool limit (96.9 GiB) during warmup while serving afterwards peaks
+20–30 GB lower. The 192K warmup that succeeded peaked at 96,894 MiB of 96,895. Cause unknown. Judge warmup by whether
+it completes; enforce a headroom floor only during serving.
 
 ## Sparse DSA: implemented, correct, and not the default
 
@@ -110,6 +135,11 @@ At 64K it is 25.1 s against 11.6 s. Quality is fine — perplexity on two held-o
 at 32K — but prefill is 1.9–2.2× slower than dense because the per-query gathers are bandwidth-bound and the dense
 call is still needed for the exact early rows. **Dense stays the serving default.** The earlier mask-based path also
 needed 37.7 GiB of warmup workspace; the gather removed ~35 GiB of that.
+
+The prefill curve above closes the question of whether sparse could ever pay off here. At 192K — the largest context
+this hardware serves, in the configuration that serves it — the quadratic part of prefill is under 30 % of the time.
+A sparse path that made that term free would still have to beat dense on the other 70 %, and it currently loses there
+by roughly 2×. Sparse DSA is not worth further engineering at any context this box can serve.
 
 ## Failed or not worth it
 
