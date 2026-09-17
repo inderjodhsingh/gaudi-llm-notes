@@ -82,6 +82,11 @@ Dense MLA (the serving default), needle retrieval = a 6-digit code inserted at a
 
 The 192K and 256K rows need **chunked prefill**; the others do not. Serving headroom is 22.7 GiB per card at 192K and 14.0 GiB at 256K.
 
+> **The two prefill figures for 128K are both correct and are not comparable.** The table above says 25.5 s; the
+> scaling table below says 30.8 s. The first is unchunked at 8 sequences, the second is a point on a single chunked
+> 2-sequence curve measured end to end for the fit. Chunking costs about 20 % at 128K and is what makes 192K and 256K
+> possible at all. Compare within a table, never across them.
+
 ### Prefill scaling
 
 Six points, one request at a time, three timed runs each (repeat spread ≤ 0.054 s), fitting `t(L) = aL + bL²` with no
