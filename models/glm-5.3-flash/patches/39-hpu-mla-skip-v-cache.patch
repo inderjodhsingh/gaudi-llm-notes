@@ -1,0 +1,60 @@
+From 4d336474dcced6f5a1d9ac259582a9d4646e22ed Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 05:37:01 +0000
+Subject: [PATCH] HPU: VLLM_HPU_MLA_SKIP_V_CACHE placeholder V cache for latent
+ MLA layers (halves KV memory; opt-in)
+
+---
+ vllm_gaudi/extension/features.py         |  1 +
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 16 ++++++++++++++--
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_gaudi/extension/features.py b/vllm_gaudi/extension/features.py
+index 7a0f936..8f3926d 100644
+--- a/vllm_gaudi/extension/features.py
++++ b/vllm_gaudi/extension/features.py
+@@ -106,6 +106,7 @@ def get_features():
+               check=choice('exp', 'lin', 'pad')),
+         Value('defrag', Enabled('use_contiguous_pa')),
+         Value('regional_compilation', True, env_var='VLLM_T_COMPILE_REGIONAL_COMPILATION', env_var_type=boolean),
++        Value('mla_skip_v_cache', False, env_var='VLLM_HPU_MLA_SKIP_V_CACHE', env_var_type=boolean),
+         Value('dynamic_shapes_compilation', True, env_var='VLLM_T_COMPILE_DYNAMIC_SHAPES', env_var_type=boolean),
+         Value('fullgraph_compilation', False, env_var='VLLM_T_COMPILE_FULLGRAPH', env_var_type=boolean),
+         Value('scale_adjustment', True, env_var='VLLM_SCALE_ADJUSTMENT', env_var_type=boolean),
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 251465b..f586321 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -6982,7 +6982,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                             attn_kernel_block_size, blocks_per_kv_block, num_kernel_blocks, kv_cache_shape)
+                         # here attn does not share kv cache tensor, so we create separate tensors
+                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
+-                        vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
++                        if isinstance(kv_cache_spec, MLAAttentionSpec) and get_config().mla_skip_v_cache:
++                            # Latent MLA reads/writes only kv_cache[0] (oot_mla.py); the
++                            # full-size V cache doubled KV memory for nothing. Keep a
++                            # 1-row placeholder so tuple consumers still unpack.
++                            vc = torch.zeros((1, *kv_cache_shape[1:]), dtype=kv_cache_spec.dtype, device=self.device)
++                        else:
++                            vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
+                         kv_caches[layer_name] = (kc, vc, None, None)
+                     elif isinstance(kv_cache_spec, MambaSpec) and \
+                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
+@@ -7057,7 +7063,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                                                                               kv_cache_spec.head_size)
+                         # here attn does not share kv cache tensor, so we create separate tensors
+                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
+-                        vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
++                        if isinstance(kv_cache_spec, MLAAttentionSpec) and get_config().mla_skip_v_cache:
++                            # Latent MLA reads/writes only kv_cache[0] (oot_mla.py); the
++                            # full-size V cache doubled KV memory for nothing. Keep a
++                            # 1-row placeholder so tuple consumers still unpack.
++                            vc = torch.zeros((1, *kv_cache_shape[1:]), dtype=kv_cache_spec.dtype, device=self.device)
++                        else:
++                            vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
+                         kv_caches[layer_name] = (kc, vc, None, None)
+                     elif isinstance(kv_cache_spec, MambaSpec) and \
+                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
+-- 
+2.43.0
+

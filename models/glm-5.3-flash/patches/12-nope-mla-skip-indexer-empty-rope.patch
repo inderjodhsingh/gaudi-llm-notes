@@ -1,0 +1,74 @@
+From ccc7949e047ff94d64fd64eef504421396b50a92 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 11:54:10 +0000
+Subject: [PATCH] NoPE MLA: skip rope/indexer on HPU, empty qk_rope splits
+
+---
+ vllm/model_executor/layers/mla.py        | 16 ++++++++++------
+ vllm/models/glm5next/nvidia/attention.py |  8 +++++++-
+ 2 files changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 0175e202e..0f37cb7e4 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -170,10 +170,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             )
+ 
+             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+-            q_c, kv_lora = qkv_lora.split(
+-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+-                dim=-1,
+-            )
++            kv_width = self.kv_lora_rank + self.qk_rope_head_dim
++            q_c, kv_lora = qkv_lora.split([self.q_lora_rank, kv_width], dim=-1)
+             q_c = self.q_a_layernorm(q_c)
+             q_proj_layer = self.q_b_proj
+             q_proj_input = q_c
+@@ -188,9 +186,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             q_proj_layer = self.q_proj
+             q_proj_input = hidden_states
+ 
+-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
++        if self.qk_rope_head_dim == 0:
++            kv_c = kv_lora
++            k_pe = kv_lora.new_zeros(*kv_lora.shape[:-1], 0)
++        else:
++            kv_c, k_pe = kv_lora.split(
++                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
++            )
+         kv_c_normed = self.kv_a_layernorm(kv_c)
+-        # Add head dim of 1 to k_pe
++        # Add head dim of 1 to k_pe (empty when NoPE / qk_rope_head_dim=0)
+         k_pe = k_pe.unsqueeze(1)
+ 
+         q = q_proj_layer(q_proj_input)[0]
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 8ec13c36e..6dcaa0e4b 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -429,6 +429,9 @@ class Glm5NextMLAAttention(nn.Module):
+ 
+         self.scaling = self.qk_head_dim**-0.5
+         self.max_position_embeddings = max_position_embeddings
++        # NoPE (qk_rope_head_dim=0) or checkpoint mla_use_nope: never build rope.
++        if qk_rope_head_dim == 0:
++            skip_rope = True
+ 
+         # Use input_size for projection input dimensions if provided,
+         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
+@@ -513,7 +516,10 @@ class Glm5NextMLAAttention(nn.Module):
+         # `index_topk` is declared on Glm5NextTextConfig with a default of None,
+         # so hasattr() is True even for full-MLA configs (no kpool indexer).
+         self.is_v32 = getattr(config, "index_topk", None) is not None
+-        # self.is_v32 = False
++        # Phase 3a: HPU has no DSA/kpool. Run the 11 sparse layers as dense NoPE
++        # MLA (exact for ctx <= index_topk). Do not construct the CUDA indexer.
++        if current_platform.is_hpu():
++            self.is_v32 = False
+ 
+         _skip_topk = False
+         if self.is_v32:
+-- 
+2.43.0
+

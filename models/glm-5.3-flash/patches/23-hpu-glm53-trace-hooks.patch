@@ -1,0 +1,154 @@
+From 504cbfe62d0933b24052f53bcd51cca3157b385f Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 15:49:30 +0000
+Subject: [PATCH] HPU GLM-5.3: per-layer activation trace hooks
+ (GLM53_TRACE_DIR)
+
+Bring-up only. Dumps attn/mlp in/out per layer, final norm, logits on
+rank 0 while <dir>/ENABLE exists, for CPU-vs-HPU bisection (Gate 4).
+---
+ vllm_gaudi/glm53_trace.py                | 112 +++++++++++++++++++++++
+ vllm_gaudi/v1/worker/hpu_model_runner.py |   8 ++
+ 2 files changed, 120 insertions(+)
+ create mode 100644 vllm_gaudi/glm53_trace.py
+
+diff --git a/vllm_gaudi/glm53_trace.py b/vllm_gaudi/glm53_trace.py
+new file mode 100644
+index 0000000..52d38c2
+--- /dev/null
++++ b/vllm_gaudi/glm53_trace.py
+@@ -0,0 +1,112 @@
++"""GLM-5.3-Flash bring-up: per-layer activation dumps for CPU-vs-HPU bisection.
++
++Enabled with ``GLM53_TRACE_DIR=<dir>``. Dumps happen only while ``<dir>/ENABLE``
++exists, so touch it right before sending a request (warmup / profile runs are
++not captured). Rank 0 only. Eager mode only: hooks do not fire inside compiled
++or HPU-graph-captured regions.
++
++Files: ``step{N}_{tag}.pt`` with tags ``input_ids``, ``positions``,
++``L{i}_attn_in``, ``L{i}_attn_out``, ``L{i}_mlp_in``, ``L{i}_mlp_out``,
++``L{i}_layer_out``, ``final_norm_out``, ``logits``.
++"""
++import os
++
++import torch
++
++from vllm_gaudi.extension.logger import logger as init_logger
++
++logger = init_logger()
++
++
++class _Tracer:
++
++    def __init__(self, out_dir: str, rank: int):
++        self.out_dir = out_dir
++        self.rank = rank
++        self.step = -1
++        self.flag = os.path.join(out_dir, "ENABLE")
++        if rank == 0:
++            os.makedirs(out_dir, exist_ok=True)
++
++    def enabled(self) -> bool:
++        return self.rank == 0 and os.path.exists(self.flag)
++
++    def save(self, tag: str, t) -> None:
++        if not self.enabled():
++            return
++        if isinstance(t, (tuple, list)):
++            t = t[0] if len(t) else None
++        if t is None or not torch.is_tensor(t):
++            return
++        path = os.path.join(self.out_dir, f"step{self.step:03d}_{tag}.pt")
++        torch.save(t.detach().to("cpu"), path)
++
++    @staticmethod
++    def hs(args, kwargs):
++        if kwargs and "hidden_states" in kwargs:
++            return kwargs["hidden_states"]
++        if kwargs and "x" in kwargs:
++            return kwargs["x"]
++        return args[0] if args else None
++
++
++def _find(model, cls_name: str):
++    for _, m in model.named_modules():
++        if type(m).__name__ == cls_name:
++            return m
++    return None
++
++
++def install_trace_hooks(model: torch.nn.Module, out_dir: str, rank: int) -> None:
++    tr = _Tracer(out_dir, rank)
++    if rank != 0:
++        return
++
++    inner = _find(model, "Glm5NextModel")
++    if inner is None or not hasattr(inner, "layers"):
++        logger.warning("GLM53_TRACE: Glm5NextModel not found; no hooks installed")
++        return
++
++    def model_pre(mod, args, kwargs):
++        if not tr.enabled():
++            return
++        tr.step += 1
++        ids = kwargs.get("input_ids", args[0] if len(args) > 0 else None)
++        pos = kwargs.get("positions", args[1] if len(args) > 1 else None)
++        tr.save("input_ids", ids)
++        tr.save("positions", pos)
++
++    inner.register_forward_pre_hook(model_pre, with_kwargs=True)
++    inner.register_forward_hook(lambda m, a, k, o: tr.save("final_norm_out", o), with_kwargs=True)
++
++    for i, layer in enumerate(inner.layers):
++        tag = f"L{i:02d}"
++
++        def mk_pre(name):
++
++            def f(m, args, kwargs):
++                tr.save(name, tr.hs(args, kwargs))
++
++            return f
++
++        def mk_post(name):
++
++            def f(m, args, kwargs, out):
++                tr.save(name, out)
++
++            return f
++
++        if hasattr(layer, "self_attn"):
++            layer.self_attn.register_forward_pre_hook(mk_pre(f"{tag}_attn_in"), with_kwargs=True)
++            layer.self_attn.register_forward_hook(mk_post(f"{tag}_attn_out"), with_kwargs=True)
++        if hasattr(layer, "mlp"):
++            layer.mlp.register_forward_pre_hook(mk_pre(f"{tag}_mlp_in"), with_kwargs=True)
++            layer.mlp.register_forward_hook(mk_post(f"{tag}_mlp_out"), with_kwargs=True)
++        layer.register_forward_hook(mk_post(f"{tag}_layer_out"), with_kwargs=True)
++
++    lp = _find(model, "LogitsProcessor")
++    if lp is not None:
++        lp.register_forward_hook(lambda m, a, k, o: tr.save("logits", o), with_kwargs=True)
++
++    logger.info("GLM53_TRACE: hooks installed on %d layers, dir=%s (touch %s to enable)", len(inner.layers), out_dir,
++                tr.flag)
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index d3f07bc..d7020f1 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -5007,6 +5007,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             htcore.mark_step()
+ 
+         apply_model_specific_patches(self)
++        # GLM-5.3 bring-up: per-layer activation dumps for CPU-vs-HPU bisection.
++        if os.environ.get("GLM53_TRACE_DIR"):
++            from vllm_gaudi.glm53_trace import install_trace_hooks
++            try:
++                _trace_rank = get_tensor_model_parallel_rank()
++            except Exception:
++                _trace_rank = int(os.environ.get("RANK", "0"))
++            install_trace_hooks(self.model, os.environ["GLM53_TRACE_DIR"], _trace_rank)
+         try:
+             hidden_layer_markstep_interval = int(os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
+         except ValueError:
+-- 
+2.43.0
+

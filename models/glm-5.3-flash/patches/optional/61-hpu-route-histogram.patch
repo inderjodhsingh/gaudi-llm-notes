@@ -1,0 +1,233 @@
+From c91f58df1970d4a2d381ac8925f51d9e2512c8e4 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 12:27:58 +0000
+Subject: [PATCH] patch 61: per-layer expert routing histogram, opt-in with
+ GLM53_ROUTE_HIST_DIR
+
+Counts real (unpadded) token-slots per global expert id in every MoE op, split prompt/decode, with RESET/DUMP
+control files answered by rank 0. Used to find experts an accounting-firm workload never routes to.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ vllm_gaudi/extension/ops.py              | 34 +++++++++
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 96 ++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+)
+
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index 705ba0a..4b179b7 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -661,6 +661,36 @@ class MoeMatmul(torch.nn.Module):
+ 
+ 
+ 
++# --- GLM-5.3 expert-usage histogram (patch 61; opt-in with GLM53_ROUTE_HIST_DIR) --------------------------------
++# Counts, per MoE op instance (= per decoder layer) and per phase (0 prompt, 1 decode), how many real token-slots
++# the router sent to each GLOBAL expert id. The runner sets ROUTE_HIST['phase'] and ROUTE_HIST['row_mask'] (a
++# [tokens] bool tensor marking unpadded rows, or None to count every row) before each model forward, keeps the
++# real-token counters in ROUTE_HIST['tokens'], and reads the per-op tensors on DUMP. Counting uses the global ids
++# before localisation, so every rank would see the same numbers. Static shapes only: index_add_ with a 0/1 weight,
++# no boolean indexing, no host sync; the MoE op runs eagerly (patch 37), so this adds ~2 small eager ops per layer.
++ROUTE_HIST = {"enabled": False, "phase": 0, "row_mask": None, "tokens": None}
++
++
++def _route_hist_count(op, topk_ids):
++    if not ROUTE_HIST["enabled"]:
++        return
++    hist = getattr(op, "_route_hist", None)
++    if hist is None:
++        n = int(getattr(op, "global_num_experts", 0) or 0)
++        if n <= 0:
++            return
++        hist = torch.zeros(2, n, dtype=torch.int64, device=topk_ids.device)
++        op._route_hist = hist
++    ids = topk_ids.reshape(-1).to(torch.int64)
++    rows, k = int(topk_ids.shape[0]), int(topk_ids.shape[-1])
++    mask = ROUTE_HIST["row_mask"]
++    if mask is None or int(mask.numel()) != rows:
++        w = torch.ones_like(ids)
++    else:
++        w = mask.to(torch.int64).unsqueeze(1).expand(rows, k).reshape(-1)
++    hist[ROUTE_HIST["phase"]].index_add_(0, ids, w)
++
++
+ def _localize_routing_ids(routing_ids, experts_min, experts_max, global_num_experts=None):
+     """Rebase global expert ids to this rank's local weight slots.
+ 
+@@ -790,6 +820,7 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+         return ret
+ 
+     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
++        _route_hist_count(self, expert_routing_table)
+         expert_routing_table, emin, emax = _localize_routing_ids(expert_routing_table, self.experts_min, self.experts_max,
+                                                           getattr(self, 'global_num_experts', None))
+         tokens_num, _ = hidden_states.shape
+@@ -1331,6 +1362,7 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        _route_hist_count(self, topk_ids)
+         topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
+                                                           getattr(self, 'global_num_experts', None))
+         tokens_num, _ = x.shape
+@@ -1429,6 +1461,7 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        _route_hist_count(self, topk_ids)
+         topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
+                                                           getattr(self, 'global_num_experts', None))
+         tokens_num, _ = x.shape
+@@ -1650,6 +1683,7 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        _route_hist_count(self, topk_ids)
+         topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
+                                                           getattr(self, 'global_num_experts', None))
+         activation = _as_activation_str(activation)
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 965c4b4..76eab40 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -108,6 +108,7 @@ from vllm.lora.request import LoRARequest
+ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+ from vllm.model_executor.models import supports_lora, supports_multimodal
+ from vllm_gaudi.extension.ops import LoraMask as LoraMask
++import vllm_gaudi.extension.ops as _ext_ops
+ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiKVConnectorMetadata
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlConnectorMetadata
+@@ -3864,6 +3865,96 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         if not seen and not warmup_mode:
+             logger.warning("Configuration: %s was not warmed-up!", cfg)
+ 
++    # --- GLM-5.3 expert-usage histogram (patch 61, opt-in GLM53_ROUTE_HIST_DIR) ---------------------------------
++    # Per-layer, per-phase counts of which global expert each real token-slot was routed to, accumulated inside the
++    # MoE op (extension/ops.py _route_hist_count). The runner tells the op which rows of the padded batch are real
++    # and which phase is running, and answers two control files in the directory: RESET (zero everything) and DUMP
++    # (write hist_rank<r>_<n>.json). Rank 0 alone answers them: every rank routes identically after the all-reduce.
++    def _route_hist_init(self):
++        self._route_hist_dir = os.environ.get("GLM53_ROUTE_HIST_DIR")
++        self._route_hist_dump_n = 0
++        self._route_hist_rank = 0
++        if not self._route_hist_dir:
++            return
++        import sys
++        try:
++            self._route_hist_rank = get_tensor_model_parallel_rank()
++        except Exception:
++            self._route_hist_rank = int(os.environ.get("RANK", "0"))
++        os.makedirs(self._route_hist_dir, exist_ok=True)
++        _ext_ops.ROUTE_HIST["tokens"] = [torch.zeros((), dtype=torch.int64, device="hpu") for _ in range(2)]
++        _ext_ops.ROUTE_HIST["enabled"] = True
++        print(f"[ROUTE-HIST] rank {self._route_hist_rank}: enabled, dir {self._route_hist_dir}", file=sys.stderr, flush=True)
++
++    def _route_hist_set(self, phase, row_mask, warmup_mode):
++        if not getattr(self, "_route_hist_dir", None):
++            return
++        rh = _ext_ops.ROUTE_HIST
++        rh["enabled"] = not warmup_mode
++        rh["phase"] = phase
++        rh["row_mask"] = row_mask
++        if not warmup_mode and row_mask is not None and rh["tokens"] is not None:
++            rh["tokens"][phase] = rh["tokens"][phase] + row_mask.sum(dtype=torch.int64)
++
++    @staticmethod
++    def _route_hist_prefill_mask(token_ids, attn_metadata):
++        # [B, S] padded prompt batch: row b holds query_len[b] = seq_len - context_len real tokens first, then padding.
++        try:
++            sl = getattr(attn_metadata, "seq_lens_tensor", None)
++            cl = getattr(attn_metadata, "context_lens_tensor", None)
++            if sl is None:
++                return None
++            q = sl if cl is None else sl - cl
++            b, s = int(token_ids.shape[0]), int(token_ids.shape[-1])
++            q = q.to(device=token_ids.device)[:b]
++            return (torch.arange(s, device=token_ids.device).unsqueeze(0) < q.unsqueeze(1)).reshape(-1)
++        except Exception:
++            return None
++
++    @staticmethod
++    def _route_hist_decode_mask(token_ids, num_real):
++        # [padded_bs, 1] decode batch: the first num_real rows are live requests.
++        return torch.arange(int(token_ids.shape[0]), device=token_ids.device) < int(num_real)
++
++    def _route_hist_control(self):
++        d = getattr(self, "_route_hist_dir", None)
++        if not d or self._route_hist_rank != 0:
++            return
++        import json
++        import re
++        import sys
++        reset = os.path.join(d, "RESET")
++        if os.path.exists(reset):
++            for m in self.model.modules():
++                h = getattr(m, "_route_hist", None)
++                if h is not None:
++                    h.zero_()
++            _ext_ops.ROUTE_HIST["tokens"] = [torch.zeros((), dtype=torch.int64, device="hpu") for _ in range(2)]
++            os.replace(reset, reset + ".done")
++            print("[ROUTE-HIST] reset", file=sys.stderr, flush=True)
++        dump = os.path.join(d, "DUMP")
++        if os.path.exists(dump):
++            layers = {}
++            for name, m in self.model.named_modules():
++                h = getattr(m, "_route_hist", None)
++                if h is None:
++                    continue
++                mo = re.search(r"layers\.(\d+)\.", name)
++                hc = h.cpu().tolist()
++                layers[mo.group(1) if mo else name] = {"prefill": hc[0], "decode": hc[1]}
++            toks = [int(t.cpu()) for t in _ext_ops.ROUTE_HIST["tokens"]]
++            self._route_hist_dump_n += 1
++            out = {"schema": 1, "rank": self._route_hist_rank, "layers": layers,
++                   "tokens": {"prefill": toks[0], "decode": toks[1]},
++                   "note": "real (unpadded) token-slots per global expert id, per decoder layer, split by prompt "
++                           "forwards (prefill) and decode forwards; each real token contributes top-k slots"}
++            path = os.path.join(d, f"hist_rank{self._route_hist_rank}_{self._route_hist_dump_n}.json")
++            with open(path + ".tmp", "w") as f:
++                json.dump(out, f)
++            os.replace(path + ".tmp", path)
++            os.replace(dump, dump + ".done")
++            print(f"[ROUTE-HIST] dumped {path} ({len(layers)} layers, tokens {toks})", file=sys.stderr, flush=True)
++
+     def _execute_model_generic(self,
+                                token_ids,
+                                position_ids,
+@@ -4598,6 +4689,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         warmup_mode = self.warmup_mode
+         self.scheduler_output = None
+         self.warmup_mode = False
++        if not warmup_mode:
++            self._route_hist_control()
+ 
+         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
+         # and decodes, we must handle mixed batches. In _update_states we make
+@@ -4739,6 +4832,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+ 
+                 self.event_start = self.profiler.get_timestamp_us()
+                 self.profiler.start("internal", "prefill")
++                self._route_hist_set(0, self._route_hist_prefill_mask(token_ids, attn_metadata), warmup_mode)
+ 
+                 htorch.core.mark_step()
+                 non_flattened_hidden_states, aux_hidden_states, \
+@@ -4829,6 +4923,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                                                                pd_info.decode_req_ids, False)
+             self.event_start = self.profiler.get_timestamp_us()
+             self.profiler.start("internal", "decode")
++            self._route_hist_set(1, self._route_hist_decode_mask(decode_data.token_ids, num_decodes), warmup_mode)
+             htorch.core.mark_step()
+             non_flattened_hidden_states, aux_hidden_states, \
+                 sample_hidden_states, logits_device = \
+@@ -5206,6 +5301,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             except Exception:
+                 _trace_rank = int(os.environ.get("RANK", "0"))
+             install_trace_hooks(self.model, os.environ["GLM53_TRACE_DIR"], _trace_rank)
++        self._route_hist_init()
+         try:
+             hidden_layer_markstep_interval = int(os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
+         except ValueError:
+-- 
+2.43.0
+

@@ -1,0 +1,120 @@
+From 0f847b99424ff32a4ea5c21d49783a9d72c558a9 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 09:07:53 +0000
+Subject: [PATCH] patch 57: speculative warmup verify batches + off-grid max
+ bucket (cherry-pick of abotsis pr/core)
+
+---
+ vllm_gaudi/extension/bucketing/linear.py |  5 +++
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 42 ++++++++++++++++++++----
+ 2 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/vllm_gaudi/extension/bucketing/linear.py b/vllm_gaudi/extension/bucketing/linear.py
+index f6acf79..4f5244a 100644
+--- a/vllm_gaudi/extension/bucketing/linear.py
++++ b/vllm_gaudi/extension/bucketing/linear.py
+@@ -155,6 +155,11 @@ def warmup_range(config: Tuple[int, int, int]):
+     stable = range(bstep, bmax + 1, bstep)
+     buckets = list(ramp_up_tw) + list(stable)
+     buckets = [b for b in buckets if b >= bmin]
++    # The configured max is a bucket even when it is off the step grid (128/2048/3200 -> 128..2048 plus 3200).
++    # Otherwise the runtime adds it on demand ("... was not prepared. Adding new bucket") and compiles it on the
++    # first request that needs it. Cherry-picked from abotsis/vllm-gaudi pr/core (1587118).
++    if buckets and buckets[-1] < bmax:
++        buckets.append(bmax)
+     if add_zero_bucket:
+         buckets.append(0)
+     return list(buckets)
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 477849f..965c4b4 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -5730,7 +5730,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 LoraMask.setLoraMask(lora_logits_mask)
+ 
+             # Create dummy requests for this specific configuration
+-            dummy_req_ids = [f"warmup_req_{batch_size}_{i}" for i in range(batch_size)]
++            # Under speculative decode the decode buckets carry num_reqs * (1 + num_spec) LANES, not requests
++            # (8 seqs x 5 = 40 at MTP-4), while input_batch's per-request arrays are sized max_num_reqs. The
++            # sampler warmup needs batch_size logits rows but only max_num_reqs request slots, so cap the dummy
++            # REQUESTS here; without it top_p_cpu[i]/top_k_cpu[i] index past the end
++            # (IndexError: index 8 is out of bounds for axis 0 with size 8).
++            num_dummy_reqs = min(batch_size, self.max_num_reqs)
++            dummy_req_ids = [f"warmup_req_{batch_size}_{i}" for i in range(num_dummy_reqs)]
+ 
+             # Get TP-rank specific vocab range to use correct token IDs during warmup
+             # This ensures each TP rank compiles with tokens in its vocab range,
+@@ -6016,8 +6022,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                                             total_tokens=tokens,
+                                             scheduled_tokens=prompt_query_len,
+                                             is_prompt=True)
++        spec_tokens = None
+         if decode_cfg:
+             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
++            # Spec-decode buckets inflate bs to num_reqs * (1 + num_spec_tokens) (8 seqs x 5 = 40 lanes for
++            # MTP-4) while input_batch has max_num_reqs slots, so warmup_sampler indexed past the end
++            # (IndexError: index 8 out of bounds for axis 0 with size 8). Build those buckets the way the
++            # verify step runs them: num_reqs requests, each scheduled 1 + num_spec tokens with num_spec dummy
++            # draft ids. Shapes that cannot be expressed that way fall back to the capped one-token batch.
++            # Cherry-picked from abotsis/vllm-gaudi pr/core (1587118).
++            num_spec = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
++            spec_lanes = 1 + num_spec
++            if (num_spec and decode_bs > self.max_num_reqs and decode_bs % spec_lanes == 0
++                    and decode_bs // spec_lanes <= self.max_num_reqs):
++                capped_decode_bs = decode_bs // spec_lanes
++                tokens_per_req = spec_lanes
++            else:
++                capped_decode_bs = min(decode_bs, self.max_num_reqs)
++                tokens_per_req = 1
+             # Use attn_block_size (the actual kernel block granularity used in
+             # _create_decode_input_data) rather than block_size (the KV-manager
+             # page size).  For hybrid models these differ after
+@@ -6035,12 +6057,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                     min_tokens_per_seq = sw_blocks * decode_block_size
+                 else:
+                     min_tokens_per_seq = decode_block_size
+-                decode_seq_lengths = [min_tokens_per_seq] * decode_bs
++                decode_seq_lengths = [min_tokens_per_seq] * capped_decode_bs
+                 # Cap block_id at physical pool — contiguous PA uses
+                 # block_id as the allocation base which must be valid.
+                 block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
+             else:
+-                decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, decode_block_size)
++                # Under speculation every lane of a request carries the request's block table, so the
++                # bucket's block count is num_reqs x lanes x blocks_per_req: size the dummy sequences from
++                # num_blocks / lanes or the run lands on a larger bucket.
++                dummy_blocks = max(capped_decode_bs, decode_num_blocks // tokens_per_req)
++                decode_seq_lengths = self._generate_seq_lengths(capped_decode_bs, dummy_blocks, decode_block_size)
+                 block_id = 0
+ 
+             for dsl in decode_seq_lengths:
+@@ -6048,12 +6074,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                                         scheduled_tokens,
+                                         num_computed_tokens=dsl,
+                                         total_tokens=dsl,
+-                                        scheduled_tokens=1,
++                                        scheduled_tokens=tokens_per_req,
+                                         is_prompt=False,
+                                         block_id=block_id)
+-        self._execute_dummy_scenario(requests, scheduled_tokens)
++            if tokens_per_req > 1:
++                spec_tokens = {req.req_id: [0] * (tokens_per_req - 1) for req in requests}
++        self._execute_dummy_scenario(requests, scheduled_tokens, spec_tokens)
+ 
+-    def _execute_dummy_scenario(self, requests, scheduled_tokens):
++    def _execute_dummy_scenario(self, requests, scheduled_tokens, spec_tokens=None):
+         from vllm.v1.core.sched.output import (SchedulerOutput, CachedRequestData)
+ 
+         sched_output = SchedulerOutput(
+@@ -6061,7 +6089,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             scheduled_cached_reqs=CachedRequestData.make_empty(),
+             num_scheduled_tokens=scheduled_tokens,
+             total_num_scheduled_tokens=sum(scheduled_tokens.values()),
+-            scheduled_spec_decode_tokens={},
++            scheduled_spec_decode_tokens=spec_tokens or {},
+             scheduled_encoder_inputs={},
+             num_common_prefix_blocks=0,
+             finished_req_ids=set(),
+-- 
+2.43.0
+

@@ -13,6 +13,8 @@ Each model gets a folder under [`models/`](models/):
 
 This is engineering documentation, not a vendor benchmark. Numbers are single-stream greedy (temperature 0) unless stated otherwise.
 
+Out-of-tree HPU ports (Flash-Next, GLM-5.3-Flash) ship as diffs under `models/<slug>/patches/` plus a Dockerfile. They are not in upstream vllm-gaudi.
+
 ## Add another model
 
 1. Copy [`templates/model-note/`](templates/model-note/) to `models/<slug>/`.

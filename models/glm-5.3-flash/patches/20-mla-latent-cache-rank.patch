@@ -1,0 +1,60 @@
+From 566d601eca471eaebdc09e34c640f49dcd64e972 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 14:15:50 +0000
+Subject: [PATCH] HPU MLA: match latent writes to cache rank (2D vs 3D)
+
+Hybrid alloc used V1 paged shape (slots, kv_heads, D) while MLA
+latents are (tokens, D); index_copy_ requires matching rank.
+---
+ vllm_gaudi/attention/oot_mla.py          |  7 ++++++-
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 16 ++++++++++++----
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index 07ee510..4405930 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -169,7 +169,12 @@ class HPUMLAAttention(MLAAttention):
+         # write the latent and rope to kv cache
+         if kv_cache is not None and len(kv_cache) >= 2:
+             # Always use impl-owned cache op so INC quantization maps to one canonical module path.
+-            self.impl.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
++            k_cache = kv_cache[0]
++            # Hybrid alloc may use the V1 paged shape (slots, kv_heads, D)
++            # while MLA latents are (tokens, D). Match trailing dims for index_copy_.
++            if k_cache.dim() > latent_vec_k.dim():
++                latent_vec_k = latent_vec_k.reshape(latent_vec_k.shape[0], *k_cache.shape[1:])
++            self.impl.latent_cache_k(latent_vec_k, k_cache, slot_mapping)
+ 
+         if is_prefill:
+             output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 0a87a65..d3f07bc 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -6854,10 +6854,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                         # The flat tensor must accommodate all kernel blocks.
+                         blocks_per_kv_block = kv_cache_spec.block_size // attn_kernel_block_size
+                         num_kernel_blocks = num_blocks * blocks_per_kv_block
+-                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_kernel_blocks + 1,
+-                                                                              attn_kernel_block_size,
+-                                                                              kv_cache_spec.num_kv_heads,
+-                                                                              kv_cache_spec.head_size)
++                        if isinstance(kv_cache_spec, MLAAttentionSpec):
++                            from vllm_gaudi.attention.backends.hpu_attn import HPUMLAAttentionBackend
++                            kv_cache_shape = HPUMLAAttentionBackend.get_kv_cache_shape(
++                                num_kernel_blocks + 1,
++                                attn_kernel_block_size,
++                                kv_cache_spec.num_kv_heads,
++                                kv_cache_spec.head_size)
++                        else:
++                            kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_kernel_blocks + 1,
++                                                                                  attn_kernel_block_size,
++                                                                                  kv_cache_spec.num_kv_heads,
++                                                                                  kv_cache_spec.head_size)
+                         logger.debug(
+                             "Hybrid ATN alloc: layer=%s num_blocks=%d "
+                             "spec_block_size=%d kernel_block_size=%d "
+-- 
+2.43.0
+

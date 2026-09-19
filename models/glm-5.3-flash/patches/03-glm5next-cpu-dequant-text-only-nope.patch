@@ -1,0 +1,189 @@
+From e959175b55e49d4e52ac74b23eb0450c8a90764a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:11:34 +0000
+Subject: [PATCH] cpu-dequant glm5next fp8 attn, skip visual when
+ language_model_only, skip NoPE indexer rope
+
+---
+ vllm/models/glm5next/nvidia/attention.py | 17 +++--
+ vllm/models/glm5next/nvidia/model.py     | 91 ++++++++++++++++++------
+ 2 files changed, 80 insertions(+), 28 deletions(-)
+
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 03a606ec3..8ec13c36e 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -517,12 +517,17 @@ class Glm5NextMLAAttention(nn.Module):
+ 
+         _skip_topk = False
+         if self.is_v32:
+-            self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
+-                qk_rope_head_dim,
+-                max_position=max_position_embeddings,
+-                rope_parameters=config.rope_parameters,
+-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+-            )
++            # GLM-5.3-Flash is NoPE (qk_rope_head_dim=0). get_rope(0) asserts
++            # on several backends (SM120 pe_dim==64, GB10). Skip empty rope.
++            if qk_rope_head_dim > 0 and config.rope_parameters is not None:
++                self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
++                    qk_rope_head_dim,
++                    max_position=max_position_embeddings,
++                    rope_parameters=config.rope_parameters,
++                    is_neox_style=not getattr(config, "indexer_rope_interleave", False),
++                )
++            else:
++                self.indexer_rope_emb = None
+             # The sparse indexer projects from the MLA q-lora rank, which is
+             # always set for v32 MLA configs; narrow away the `int | None`.
+             assert q_lora_rank is not None
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index 9397bce94..b326628a4 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -68,6 +68,8 @@ from vllm.model_executor.models.interfaces import (
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
++    StageMissingLayer,
++    WeightsMapper,
+     init_vllm_registered_model,
+     is_pp_missing_parameter,
+     make_layers,
+@@ -967,7 +969,9 @@ class Glm5NextForCausalLM(
+             self,
+             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+         )
+-        return loader.load_weights(weights)
++        loaded = loader.load_weights(weights)
++        self._glm53_loaded_params = loaded
++        return loaded
+ 
+ 
+ @MULTIMODAL_REGISTRY.register_processor(
+@@ -1019,29 +1023,34 @@ class Glm5NextForConditionalGeneration(
+         self.config = config
+         self.model_config = vllm_config.model_config
+         self.multimodal_config = multimodal_config
+-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+-        self.is_multimodal_pruning_enabled = (
+-            multimodal_config.is_multimodal_pruning_enabled()
++        self.language_model_only = bool(
++            getattr(multimodal_config, "language_model_only", False)
+         )
+-
+-        with self._mark_tower_model(vllm_config, {"image", "video"}):
+-            self.visual = Glm5NextVisionTransformer(
+-                config.text_config,
+-                config.vision_config,
+-                # Read eps from the VISION sub-config, not the top-level
+-                # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
+-                # the latter onto text_config (1e-5), silently ignoring the
+-                # vision tower's own (1e-6) rms_norm_eps.
+-                norm_eps=config.vision_config.rms_norm_eps,
+-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
+-                # weight_scale_inv for visual.*), so it must NOT inherit the
+-                # global fp8 quant_config -- doing so incorrectly quantizes
+-                # the tower
+-                # and yields NaN image features. Mirrors the MLA/KDA proj
+-                # pattern (quant_config=None for BF16 submodules).
+-                quant_config=None,
+-                prefix=maybe_prefix(prefix, "visual"),
++        if self.language_model_only:
++            self.use_data_parallel = False
++            self.is_multimodal_pruning_enabled = False
++            self.visual = StageMissingLayer("vision_tower")
++            self._tower_model_names = []
++        else:
++            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++            self.is_multimodal_pruning_enabled = (
++                multimodal_config.is_multimodal_pruning_enabled()
+             )
++            with self._mark_tower_model(vllm_config, {"image", "video"}):
++                self.visual = Glm5NextVisionTransformer(
++                    config.text_config,
++                    config.vision_config,
++                    # Read eps from the VISION sub-config, not the top-level
++                    # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__
++                    # mirrors the latter onto text_config (1e-5), silently
++                    # ignoring the vision tower's own (1e-6) rms_norm_eps.
++                    norm_eps=config.vision_config.rms_norm_eps,
++                    # Vision tower ships BF16 weights in this fp8 checkpoint
++                    # (no weight_scale_inv for visual.*), so it must NOT inherit
++                    # the global fp8 quant_config.
++                    quant_config=None,
++                    prefix=maybe_prefix(prefix, "visual"),
++                )
+ 
+         with self._mark_language_model(vllm_config):
+             self.language_model = init_vllm_registered_model(
+@@ -1064,6 +1073,20 @@ class Glm5NextForConditionalGeneration(
+         config.buffer_keys = [k for k in config.buffer_keys if k != "pos_embeds"]
+         return config
+ 
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        skip_prefixes = []
++        mapper_kwargs: dict = {}
++        if getattr(self, "language_model_only", False):
++            skip_prefixes.append("visual.")
++            mapper_kwargs["orig_to_new_prefix"] = {"visual.": None}
++        mapper = self.hf_to_vllm_mapper
++        if mapper_kwargs:
++            mapper = mapper | WeightsMapper(**mapper_kwargs)
++        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes or None)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        self._glm53_loaded_params = loaded
++        return loaded
++
+ 
+ def get_spec_layer_idx_from_weight_name(
+     config: Glm5NextConfig, weight_name: str
+@@ -1096,6 +1119,9 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+     weight_fp8, scale_inv = entry["weight"], entry["scale"]
+     del buf[layer_prefix]
+     block_size = weight_fp8.shape[1] // scale_inv.shape[1]
++    # CPU dequant: Gaudi2 e4m3fn exp=15 -> Inf/NaN on HPU.
++    weight_fp8 = _e4m3fn_to_cpu(weight_fp8)
++    scale_inv = scale_inv.detach().to("cpu")
+     weight_bf16 = scaled_dequantize(
+         weight_fp8,
+         scale_inv,
+@@ -1110,6 +1136,23 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+     return True
+ 
+ 
++def _e4m3fn_to_cpu(t: torch.Tensor) -> torch.Tensor:
++    """Bit-copy e4m3fn to CPU. Prefer the plugin helper; fall back to uint8 view."""
++    try:
++        from vllm_gaudi.extension.ops import _e4m3fn_bits_to_cpu
++
++        return _e4m3fn_bits_to_cpu(t)
++    except Exception:
++        if not torch.is_tensor(t):
++            return t
++        if t.dtype != torch.float8_e4m3fn:
++            return t.detach().to("cpu") if t.device.type != "cpu" else t.detach()
++        u8 = t.detach().contiguous().view(torch.uint8)
++        if u8.device.type != "cpu":
++            u8 = u8.cpu()
++        return u8.view(torch.float8_e4m3fn)
++
++
+ def _dequant_fp8_block(
+     weight_fp8: torch.Tensor,
+     scale_inv: torch.Tensor,
+@@ -1121,7 +1164,11 @@ def _dequant_fp8_block(
+     block) shape by zero-padding to a multiple of ``block_size`` before the
+     scale broadcast and trimming back afterwards (e.g. kv_a_proj_with_mqa is
+     576 rows = 4*128 + 64).
++
++    Always runs on CPU. Gaudi2's e4m3fn decoder turns exp=15 into Inf/NaN.
+     """
++    weight_fp8 = _e4m3fn_to_cpu(weight_fp8)
++    scale_inv = scale_inv.detach().to("cpu")
+     out_dim, in_dim = weight_fp8.shape
+     pad_out = (-out_dim) % block_size
+     pad_in = (-in_dim) % block_size
+-- 
+2.43.0
+

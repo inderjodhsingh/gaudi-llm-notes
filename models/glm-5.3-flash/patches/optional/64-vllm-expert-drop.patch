@@ -1,0 +1,207 @@
+From f089fd625773b2348ebfb85e9d8da469f5eb9480 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 14:03:33 +0000
+Subject: [PATCH] patch 64: expert-map override hook for physical expert
+ dropping
+
+Module-level override callback in expert_map_manager (layer_name, ep_size, ep_rank, global_num_experts) ->
+(local_num_experts, expert_map) so a plugin can give a layer a per-rank kept set with -1 for dropped experts;
+validated (linear placement, EPLB off, every local slot used once, n_r >= 1), refuses elastic update and LoRA under
+an override. No-op when the hook returns None.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../layers/fused_moe/expert_map_manager.py    | 101 ++++++++++++++++++
+ vllm/model_executor/layers/fused_moe/layer.py |   7 ++
+ 2 files changed, 108 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/expert_map_manager.py b/vllm/model_executor/layers/fused_moe/expert_map_manager.py
+index 71f2186ea..a6bc07f35 100644
+--- a/vllm/model_executor/layers/fused_moe/expert_map_manager.py
++++ b/vllm/model_executor/layers/fused_moe/expert_map_manager.py
+@@ -7,6 +7,8 @@ This module contains the ExpertMapManager class which manages expert ID
+ mappings and placement strategies for Expert Parallelism in MoE models.
+ """
+ 
++from collections.abc import Callable
++
+ import torch
+ 
+ from vllm.config.parallel import ExpertPlacementStrategy
+@@ -18,6 +20,31 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+ 
+ logger = init_logger(__name__)
+ 
++# Optional per-layer override of the EP expert placement, registered by a
++# platform plugin (vllm-gaudi's opt-in physical expert drop, GLM53_EXPERT_DROP).
++# Called once per FusedMoE layer with (layer_name, ep_size, ep_rank,
++# global_num_experts); it returns None to keep the standard placement, or
++# (local_num_experts, expert_map) where expert_map is a [global_num_experts]
++# int32 tensor holding this rank's local slot (0..local_num_experts-1, each used
++# once) or -1. The weight loader then skips the -1 experts (their tensors are
++# never allocated on this rank) and create_weights sizes the expert params to
++# local_num_experts. Only linear placement, no fused shared experts, no AITER
++# masks and no EPLB/elastic EP are supported under an override; per-rank counts
++# may differ (the caller owns the routing-id remap that makes this consistent).
++ExpertMapOverride = Callable[
++    [str | None, int, int, int], tuple[int, torch.Tensor] | None
++]
++_EXPERT_MAP_OVERRIDE: ExpertMapOverride | None = None
++
++
++def set_expert_map_override(fn: ExpertMapOverride | None) -> None:
++    global _EXPERT_MAP_OVERRIDE
++    _EXPERT_MAP_OVERRIDE = fn
++
++
++def get_expert_map_override() -> ExpertMapOverride | None:
++    return _EXPERT_MAP_OVERRIDE
++
+ 
+ def determine_expert_map(
+     ep_size: int,
+@@ -192,6 +219,7 @@ class ExpertMapManager:
+         enable_eplb: bool,
+         num_fused_shared_experts: int = 0,
+         rocm_aiter_enabled: bool = False,
++        layer_name: str | None = None,
+     ):
+         """
+         Initialize expert map manager.
+@@ -203,6 +231,8 @@ class ExpertMapManager:
+             placement_strategy: Strategy for placing experts ('linear' or 'round_robin')
+             num_fused_shared_experts: Number of fused shared experts (for AITER)
+             rocm_aiter_enabled: Whether ROCm AITER fusion is enabled
++            layer_name: The FusedMoE layer prefix, handed to a registered
++                expert-map override so it can look up a per-layer plan
+         """
+         self.global_num_experts = global_num_experts
+         self.moe_parallel_config = moe_parallel_config
+@@ -210,6 +240,9 @@ class ExpertMapManager:
+         self.rocm_aiter_enabled = rocm_aiter_enabled
+         self.top_k = top_k
+         self.max_num_batched_tokens = max_num_batched_tokens
++        self.layer_name = layer_name
++        self.enable_eplb = enable_eplb
++        self._override_active = False
+ 
+         if moe_parallel_config.use_ep:
+             # Determine expert placement strategy before creating manager
+@@ -228,6 +261,7 @@ class ExpertMapManager:
+ 
+         # Calculate expert mappings
+         self._calculate_expert_maps()
++        self._apply_expert_map_override()
+ 
+         # Initialize routing tables if needed
+         self._routing_tables = self._init_routing_tables()
+@@ -321,6 +355,11 @@ class ExpertMapManager:
+         """Expert placement strategy ('linear' or 'round_robin')."""
+         return self._placement_strategy
+ 
++    @property
++    def override_active(self) -> bool:
++        """True when a registered expert-map override replaced the placement."""
++        return self._override_active
++
+     @property
+     def routing_tables(
+         self,
+@@ -379,6 +418,13 @@ class ExpertMapManager:
+             moe_parallel_config: New MoE parallel configuration (contains ep_size,
+                                  ep_rank, backend flags)
+         """
++        if self._override_active:
++            # The override fixed this rank's local slots at construction; the
++            # per-layer plan cannot be re-derived for a new EP topology here.
++            raise RuntimeError(
++                f"{self.layer_name}: dynamic EP reconfiguration is not "
++                "supported while an expert-map override is active"
++            )
+         self.moe_parallel_config = moe_parallel_config
+         self.global_num_experts = global_num_experts
+ 
+@@ -454,6 +500,61 @@ class ExpertMapManager:
+ 
+         self._local_num_experts += self.num_fused_shared_experts
+ 
++    def _apply_expert_map_override(self) -> None:
++        """Replace the standard placement with a plugin-supplied per-layer map."""
++        fn = _EXPERT_MAP_OVERRIDE
++        if fn is None:
++            return
++        result = fn(
++            self.layer_name, self.ep_size, self.ep_rank, self.global_num_experts
++        )
++        if result is None:
++            return
++        if not self.use_ep:
++            # Without EP the layer holds every expert and no expert_map is consulted
++            # by the weight loader, so a per-rank map cannot take effect: fail loud
++            # here instead of surfacing a misleading shape mismatch later.
++            raise ValueError(
++                f"{self.layer_name}: expert-map override requires expert "
++                "parallelism (use_ep), but this layer runs without EP"
++            )
++        local_num_experts, expert_map = result
++        if self.enable_eplb:
++            raise ValueError(
++                f"{self.layer_name}: EPLB is not supported with an expert-map "
++                "override (per-rank expert counts are not uniform)"
++            )
++        if self.num_fused_shared_experts or self.rocm_aiter_enabled:
++            raise ValueError(
++                f"{self.layer_name}: fused shared experts / AITER expert masks "
++                "are not supported with an expert-map override"
++            )
++        if self._placement_strategy != "linear":
++            raise ValueError(
++                f"{self.layer_name}: expert-map override requires linear "
++                f"placement, got {self._placement_strategy}"
++            )
++        expert_map = torch.as_tensor(expert_map, dtype=torch.int32)
++        local_num_experts = int(local_num_experts)
++        if expert_map.shape != (self.global_num_experts,):
++            raise ValueError(
++                f"{self.layer_name}: override expert_map has shape "
++                f"{tuple(expert_map.shape)}, expected ({self.global_num_experts},)"
++            )
++        local_slots = expert_map[expert_map != -1]
++        if local_num_experts < 1 or not torch.equal(
++            local_slots.sort().values, torch.arange(local_num_experts, dtype=torch.int32)
++        ):
++            raise ValueError(
++                f"{self.layer_name}: override expert_map must use each local "
++                f"slot 0..{local_num_experts - 1} exactly once (got "
++                f"{local_slots.tolist()})"
++            )
++        self._local_num_experts = local_num_experts
++        self._expert_map = expert_map
++        self._expert_mask = None
++        self._override_active = True
++
+     def _init_routing_tables(
+         self,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index d9fd1385a..b0c27b207 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -272,7 +272,14 @@ def FusedMoEFactory(
+         enable_eplb=eplb_state is not None,
+         num_fused_shared_experts=num_fused_shared_experts,
+         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
++        layer_name=layer_name,
+     )
++    if expert_map_manager.override_active and vllm_config.lora_config is not None:
++        # vllm/lora/model_manager.py derives each rank's expert range as
++        # ep_rank * local_num_experts, which is false under a per-layer override.
++        raise ValueError(
++            f"{layer_name}: LoRA is not supported with an expert-map override"
++        )
+ 
+     # TODO(bnell): we should not have to create a router if the kernel is
+     # monolithic.
+-- 
+2.43.0
+

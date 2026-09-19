@@ -1,0 +1,36 @@
+From 72b73ead64d6e23a275a992ed73a322b598faa16 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:08:59 +0000
+Subject: [PATCH] HPU runner: do not mark block_list unbacked under
+ static-shape compilation
+
+The MoE 0/1-specialization guard (mark_unbacked on prompt block_list dim 0)
+injects an unbacked SymInt into the decoder-layer graph; with
+VLLM_T_COMPILE_DYNAMIC_SHAPES=false the Habana recipe compiler then takes
+its symbolic path and fails on prefill-with-context buckets. Static mode
+compiles one graph per bucket, so the guard is unnecessary there.
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index ddfc351..44a1c27 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -1218,7 +1218,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
+                                                                                model_has_chunked_attention)
+         # Avoid 0/1 size specialization on block_list dim 0 for MoE models.
+         # Must be outside compiled regions — mark_unbacked is a forbidden callable.
+-        if self.flatten_input:
++        # Only meaningful with dynamic-shape tracing: under static compilation
++        # (VLLM_T_COMPILE_DYNAMIC_SHAPES=false) every bucket gets its own graph
++        # anyway, and an unbacked dim forces the Habana recipe compiler onto its
++        # symbolic path, which fails ("Cannot convert symbols to int") for the
++        # prefill-with-context graphs (GLM-5.3 warmup, bucket (1, 3072, ctx)).
++        if self.flatten_input and get_config().dynamic_shapes_compilation:
+             attn_md = kwargs.get('attn_metadata')
+             if (attn_md is not None and getattr(attn_md, 'is_prompt', False)
+                     and getattr(attn_md, 'block_list', None) is not None):
+-- 
+2.43.0
+

@@ -1,0 +1,49 @@
+From 417c7f511e849c3a591abcb5b859565a9b61b741 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:19:41 +0000
+Subject: [PATCH] map text-only model. prefix; skip stacked loads when fused
+ target is absent
+
+---
+ vllm/models/glm5next/nvidia/model.py | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index db2e2cef0..d1b7eae13 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -817,8 +817,9 @@ class Glm5NextModel(nn.Module):
+                 if ("mlp.experts." in name) and name not in params_dict:
+                     continue
+                 name_mapped = name.replace(weight_name, param_name)
+-                # QKV fusion: skip if fused module doesn't exist in model
+-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
++                # Skip if the fused target does not exist (tiny fixture uses
++                # dense q/k/v_proj; MLA-only layers have no in_proj_qkvbfg_a).
++                if name_mapped not in params_dict:
+                     continue
+                 name = name_mapped
+                 # Skip loading extra bias for GPTQ models.
+@@ -991,6 +992,19 @@ class Glm5NextForConditionalGeneration(
+     has_inner_state: ClassVar[Literal[True]] = True
+     is_hybrid: ClassVar[Literal[True]] = True
+ 
++    # GLM-4V prefix plus a text-only fallback (tiny fixture / language_model_only
++    # dumps serialize as ``model.layers.*`` with no ``language_model`` infix).
++    # More-specific prefixes must come first so ``model.language_model.`` is
++    # not swallowed by ``model.``.
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "lm_head.": "language_model.lm_head.",
++            "model.language_model.": "language_model.model.",
++            "model.visual.": "visual.",
++            "model.": "language_model.model.",
++        }
++    )
++
+     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
+     # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
+     # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``),
+-- 
+2.43.0
+

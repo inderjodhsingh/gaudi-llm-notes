@@ -1,0 +1,32 @@
+From e3d5a52df73c414f6e3635fab60adf02e6702357 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 20:12:35 +0000
+Subject: [PATCH] HPU warmup: VLLM_HPU_WARMUP_ASCENDING=1 warms buckets
+ smallest first
+
+Default order stays largest first. Ascending order shows which smaller buckets fit when a large bucket hits a
+device-memory limit during warmup (256k dense run stopped on its first, largest bucket).
+
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 51be6f8..477849f 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -5822,7 +5822,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         phase = 'Prompt' if is_prompt else 'Decode'
+         desc = f'{phase} warmup processing: '
+         with tqdm(total=num_candidates, desc=desc, unit="item") as pbar:
+-            for idx, (batch_size, seq_len, num_blocks) in enumerate(reversed(buckets)):
++            # VLLM_HPU_WARMUP_ASCENDING=1 warms the smallest bucket first (default: largest first), so a memory limit
++            # hit on a large bucket shows which smaller buckets fit.
++            ascending = os.environ.get("VLLM_HPU_WARMUP_ASCENDING", "0").strip().lower() in ("1", "true")
++            for idx, (batch_size, seq_len, num_blocks) in enumerate(buckets if ascending else reversed(buckets)):
+                 if seq_len > self.max_num_tokens:
+                     continue
+                 # Graph memory usage is proportional to seq dimension in a batch
+-- 
+2.43.0
+

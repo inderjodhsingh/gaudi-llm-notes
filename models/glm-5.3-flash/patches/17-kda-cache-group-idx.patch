@@ -1,0 +1,88 @@
+From 52b4c63f962b3e5c43e95e53ad30752c118c311a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 13:14:58 +0000
+Subject: [PATCH] HPU KDA: dynamo-disable state-index resolve; set GLM
+ self_attn cache_group_idx
+
+2-D hybrid load_indices_tensor plus cache_group_idx=None crashed dynamo
+on assert cg is not None. GLM KDA is prefix .self_attn not .linear_attn.
+---
+ vllm_gaudi/models/glm5next_kda.py        | 23 +++++++++++++++++------
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 13 +++++++++++--
+ 2 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index cad623c..7ba111a 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -44,16 +44,27 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         super().__init__(*args, **kwargs)
+         self.cache_group_idx = None
+ 
++    @torch._dynamo.disable
+     def _resolve_state_indices(self, attn_metadata):
++        """Pick this layer's 1-D state indices from hybrid [num_groups, batch].
++
++        Dynamo must not trace this: a Python ``assert cg is not None`` on the
++        decode path trips ``jump: instruction_pointer is None`` (same as Qwen
++        GDN / Qwen4Exp). Eager extraction is a graph break either way.
++        """
+         indices = getattr(attn_metadata, "load_indices_tensor", None)
+         if indices is None:
+             indices = getattr(attn_metadata, "non_spec_state_indices_tensor", None)
+-        if indices is not None and indices.dim() > 1:
+-            cg = self.cache_group_idx
+-            assert cg is not None
+-            indices = indices.index_select(0, cg.view(1)).squeeze(0)
+-        return indices
+-
++        if indices is None or indices.dim() <= 1:
++            return indices
++        cg = self.cache_group_idx
++        if cg is None:
++            return indices[0] if indices.size(0) > 1 else indices.squeeze(0)
++        if not torch.is_tensor(cg):
++            cg = torch.tensor(cg, dtype=torch.long, device=indices.device)
++        return indices.index_select(0, cg.view(-1).to(device=indices.device)[:1]).squeeze(0)
++
++    @torch._dynamo.disable
+     def _extract_metadata(self, num_tokens):
+         attn_metadata = getattr(HPUGlm5NextLinearAttention, "_step_md", None)
+         if attn_metadata is None:
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index f91dd3b..0a87a65 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -872,11 +872,12 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+ 
+     mamba_like_arch = [
+         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
+-        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"
++        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration",
++        "Glm5NextForConditionalGeneration", "Glm5NextForCausalLM",
+     ]
+     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
+         return
+-    mamba_like_layer = ['.mixer', '.linear_attn', '.ple']
++    mamba_like_layer = ['.mixer', '.linear_attn', '.ple', '.self_attn']
+ 
+     def _get_decoder_layer_by_idx(model_obj, idx: int):
+         # Qwen3.5 multimodal path: model.language_model.model.layers
+@@ -920,6 +921,14 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+                 layer = _get_decoder_layer_by_idx(model, layer_idx)
+                 if layer is not None and hasattr(layer, "linear_attn"):
+                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
++            elif layer_name.endswith('.self_attn'):
++                # GLM-5.3 KDA: prefix is language_model.model.layers.N.self_attn
++                # (not .linear_attn). MLA self_attn has no cache_group_idx.
++                layer_idx = int(layer_name.split('.')[-2])
++                layer = _get_decoder_layer_by_idx(model, layer_idx)
++                attn = getattr(layer, "self_attn", None) if layer is not None else None
++                if attn is not None and hasattr(attn, "cache_group_idx"):
++                    attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
+             elif layer_name.endswith('.ple'):
+                 # Qwen4Exp PLE (n-gram) layer: short-conv + token state in its own cache group.
+                 layer_idx = int(layer_name.split('.')[-2])
+-- 
+2.43.0
+

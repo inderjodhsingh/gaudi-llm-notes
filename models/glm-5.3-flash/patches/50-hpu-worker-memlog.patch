@@ -1,0 +1,71 @@
+From cd237543658c06a87b73f5dde4c5bcc2b09c35f7 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:37:48 +0000
+Subject: [PATCH] HPU worker: GLM53_MEMLOG_DIR per-rank allocator memory
+ sampler on the wall clock
+
+Logs allocator in-use, running max-in-use, free (pool limit minus in-use) and allocation counters every 2 s per
+rank, so device-level hl-smi readings can be separated from live tensors (Synapse workspace is invisible to the
+allocator). Needed to decide which memory measure the headroom floor should use.
+
+---
+ vllm_gaudi/v1/worker/hpu_worker.py | 36 ++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_worker.py b/vllm_gaudi/v1/worker/hpu_worker.py
+index 94682fc..4f40711 100644
+--- a/vllm_gaudi/v1/worker/hpu_worker.py
++++ b/vllm_gaudi/v1/worker/hpu_worker.py
+@@ -52,6 +52,40 @@ def setup_step_profiler(steps):
+     return setup_profiler(warmup=0, active=active)
+ 
+ 
++
++def _start_memlog(out_dir: str, rank: int, local_rank: int, interval: float = 2.0) -> None:
++    """GLM53_MEMLOG_DIR: per-rank HPU allocator sampler on the wall clock (the same clock as an hl-smi poller).
++
++    Every `interval` seconds appends epoch, allocator in-use and running max-in-use, free as reported by mem_get_info
++    (pool limit minus in-use) and allocation counters to <dir>/memrank<rank>.csv. The HPU allocator does not see Synapse
++    graph workspace, so comparing this with hl-smi separates live tensors from device-level usage.
++    """
++    import threading
++    import time
++
++    import torch
++
++    os.makedirs(out_dir, exist_ok=True)
++    path = os.path.join(out_dir, f"memrank{rank}.csv")
++    visible = os.environ.get("HABANA_VISIBLE_MODULES", "")
++
++    def run():
++        with open(path, "a", buffering=1) as f:
++            f.write(f"# rank={rank} local_rank={local_rank} pid={os.getpid()} HABANA_VISIBLE_MODULES={visible}\n")
++            f.write("epoch,in_use_mib,max_in_use_mib,free_mib,total_mib,num_allocs,total_system_allocs\n")
++            while True:
++                try:
++                    st = torch.hpu.memory_stats()
++                    free, total = torch.hpu.mem_get_info()
++                    f.write(f"{time.time():.1f},{st['InUse'] / 2**20:.0f},{st['MaxInUse'] / 2**20:.0f},"
++                            f"{free / 2**20:.0f},{total / 2**20:.0f},{st.get('NumAllocs', 0)},"
++                            f"{st.get('TotalSystemAllocs', 0)}\n")
++                except Exception as e:  # noqa: BLE001
++                    f.write(f"# sample error {e!r}\n")
++                time.sleep(interval)
++
++    threading.Thread(target=run, name=f"glm53-memlog-{rank}", daemon=True).start()
++
+ class HPUWorker(WorkerBase):
+ 
+     def __init__(
+@@ -160,6 +194,8 @@ class HPUWorker(WorkerBase):
+         self.device = torch.device("hpu")
+         # Initialize the distributed environment.
+         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
++        if os.environ.get("GLM53_MEMLOG_DIR"):
++            _start_memlog(os.environ["GLM53_MEMLOG_DIR"], self.rank, self.local_rank)
+         # Set random seed.
+         set_random_seed(self.model_config.seed)
+         with set_current_vllm_config(self.vllm_config):
+-- 
+2.43.0
+

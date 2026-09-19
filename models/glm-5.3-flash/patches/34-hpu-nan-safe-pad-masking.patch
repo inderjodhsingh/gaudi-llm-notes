@@ -1,0 +1,93 @@
+From f058502959e0dcd26defea0bde28513b7e0ff3e9 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 01:11:30 +0000
+Subject: [PATCH] HPU GLM-5.3: NaN-safe pad handling in KDA prefill and MLA
+ prefill output
+
+With the 512-token prompt bucket (5 real tokens) logits were NaN (-9999
+logprobs, '!!!' output). Pad query rows of the fused prefill attention can
+be NaN; multiply-masking (NaN*0) leaked them into the chunked KDA and the
+saved state. Mask with torch.where, add a seq_lens-based pad-mask fallback,
+and zero pad rows of the MLA prefill output.
+---
+ vllm_gaudi/attention/oot_mla.py   | 11 +++++++++++
+ vllm_gaudi/models/glm5next_kda.py | 25 ++++++++++++++++++-------
+ 2 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index 4405930..ab7ea3e 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -178,6 +178,17 @@ class HPUMLAAttention(MLAAttention):
+ 
+         if is_prefill:
+             output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
++            # Fully masked pad query rows (bucket padding) can come out of the fused
++            # attention as NaN; zero them so they cannot leak downstream.
++            seq_lens = getattr(attn_metadata, "seq_lens_tensor", None)
++            if seq_lens is not None and output.dim() == 2:
++                n_seq = int(seq_lens.shape[0])
++                T = output.shape[0]
++                if n_seq > 0 and T % n_seq == 0:
++                    L = T // n_seq
++                    ar = torch.arange(L, device=output.device).view(1, L)
++                    valid = (ar < seq_lens.view(-1, 1)).reshape(-1, 1)
++                    output = torch.where(valid, output, torch.zeros_like(output))
+             return output
+         else:
+             output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index 845e85e..a76a7d9 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -89,6 +89,14 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         if has_initial_state is None:
+             has_initial_state = getattr(attn_metadata, "has_initial_state", None)
+         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
++        if padding_mask_flat is None and is_prompt and state_indices is not None:
++            # Fallback: valid-token mask from per-sequence query lengths (bucketed L per seq).
++            seq_lens = getattr(attn_metadata, "seq_lens_tensor", None)
++            n_seq = int(state_indices.numel())
++            if seq_lens is not None and n_seq > 0 and num_tokens % n_seq == 0:
++                L = num_tokens // n_seq
++                ar = torch.arange(L, device=seq_lens.device).view(1, L)
++                padding_mask_flat = (ar < seq_lens.view(-1, 1)[:n_seq]).reshape(-1).to(torch.int32)
+ 
+         if not is_prompt:
+             num_decodes = (state_indices.numel() if state_indices is not None else num_tokens)
+@@ -138,12 +146,16 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         # Bucket padding: pad steps must be KDA no-ops (q=k=v=0, g=0 => exp(g)=1,
+         # beta=0). Otherwise recurrent decay walks 128-token buckets and
+         # pollutes the saved state used by decode.
++        # torch.where (not multiply): pad rows can carry NaN/Inf from fully masked
++        # attention rows upstream, and NaN * 0 == NaN would leak into the chunked
++        # KDA (intra-chunk matmuls mix tokens) and into the saved state.
++        token_mask_b = None
+         if (is_prompt and padding_mask_flat is not None
+                 and padding_mask_flat.numel() == num_tokens):
+-            token_mask = padding_mask_flat.view(-1, 1).to(dtype=qkv.dtype)
+-            qkv = qkv * token_mask
+-            g = g * token_mask.view(-1, 1, 1)
+-            beta = beta * token_mask.view(-1, 1)
++            token_mask_b = padding_mask_flat.view(-1).bool()
++            qkv = torch.where(token_mask_b.view(-1, 1), qkv, torch.zeros_like(qkv))
++            g = torch.where(token_mask_b.view(-1, 1, 1), g, torch.zeros_like(g))
++            beta = torch.where(token_mask_b.view(-1, 1), beta, torch.zeros_like(beta))
+ 
+         if self._merged_conv_weight is None:
+             def _w(m):
+@@ -171,9 +183,8 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+                 activation="silu",
+                 is_prompt=True,
+             ).transpose(0, 1)
+-            if (padding_mask_flat is not None
+-                    and padding_mask_flat.numel() == mixed.size(0)):
+-                mixed = mixed * padding_mask_flat.view(-1, 1).to(dtype=mixed.dtype)
++            if token_mask_b is not None and token_mask_b.numel() == mixed.size(0):
++                mixed = torch.where(token_mask_b.view(-1, 1), mixed, torch.zeros_like(mixed))
+             q, k, v = mixed.split(self.local_projection_size, dim=-1)
+             q = q.reshape(1, -1, self.local_num_heads, self.head_dim)
+             k = k.reshape(1, -1, self.local_num_heads, self.head_dim)
+-- 
+2.43.0
+

@@ -1,0 +1,3351 @@
+From 39bbc11900114a2810a4a248e756d07f43b8fa1d Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 19:44:18 +0000
+Subject: [PATCH] Add Qwen4Exp HPU port for Qwen3.8-Flash-Next
+
+Out-of-tree vllm-gaudi support for qwen4_exp: GDN + dense attention fallback,
+PLE n-gram layer, gathered-expert FP8 MoE, sampling-metadata cache, and
+256-candidate top-k/top-p. Applies to vllm-gaudi 2dd55f97 (releases/v0.29.0)
+with stock vLLM 98dff2a8 (no vLLM tree edits).
+---
+ vllm_gaudi/models/__init__.py             |    7 +
+ vllm_gaudi/models/qwen3_5.py              |   18 +-
+ vllm_gaudi/models/qwen4_exp.py            | 1283 +++++++++++++++++++++
+ vllm_gaudi/models/qwen4_exp_groups.py     |  347 ++++++
+ vllm_gaudi/models/qwen4_exp_legacy.py     | 1116 ++++++++++++++++++
+ vllm_gaudi/models/qwen4_exp_ngram_hash.py |  175 +++
+ vllm_gaudi/ops/hpu_fp8.py                 |    8 +
+ vllm_gaudi/ops/hpu_moe_gather_fast.py     |   56 +
+ vllm_gaudi/ops/hpu_topk_topp.py           |   45 +
+ vllm_gaudi/platform.py                    |   10 +
+ vllm_gaudi/v1/worker/hpu_input_batch.py   |   12 +-
+ vllm_gaudi/v1/worker/hpu_model_runner.py  |   55 +-
+ 12 files changed, 3121 insertions(+), 11 deletions(-)
+ create mode 100644 vllm_gaudi/models/qwen4_exp.py
+ create mode 100644 vllm_gaudi/models/qwen4_exp_groups.py
+ create mode 100644 vllm_gaudi/models/qwen4_exp_legacy.py
+ create mode 100644 vllm_gaudi/models/qwen4_exp_ngram_hash.py
+ create mode 100644 vllm_gaudi/ops/hpu_moe_gather_fast.py
+ create mode 100644 vllm_gaudi/ops/hpu_topk_topp.py
+
+diff --git a/vllm_gaudi/models/__init__.py b/vllm_gaudi/models/__init__.py
+index afdeef1..a7e70fc 100644
+--- a/vllm_gaudi/models/__init__.py
++++ b/vllm_gaudi/models/__init__.py
+@@ -76,3 +76,10 @@ def register_model():
+     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
+     import vllm_gaudi.models.kimi_k25  # noqa: F401
+     import vllm_gaudi.models.gemma4_mm  # noqa: F401
++
++    # Qwen3.8-Flash-Next (qwen4_exp): HPU port (dense attention fallback for QSA,
++    # pure-torch hyper-connections, HPU-native PLE n-gram layer).
++    import os as _os
++    _q4 = "vllm_gaudi.models.qwen4_exp_legacy" if _os.getenv("QWEN4_LEGACY_MODEL") == "1" else "vllm_gaudi.models.qwen4_exp"
++    ModelRegistry.register_model("Qwen4ExpForCausalLM", f"{_q4}:HpuQwen4ExpForCausalLM")
++    ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", f"{_q4}:HpuQwen4ExpForConditionalGeneration")
+diff --git a/vllm_gaudi/models/qwen3_5.py b/vllm_gaudi/models/qwen3_5.py
+index 41c31d2..713bbd4 100644
+--- a/vllm_gaudi/models/qwen3_5.py
++++ b/vllm_gaudi/models/qwen3_5.py
+@@ -1,3 +1,4 @@
++import os
+ import torch
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
+ from vllm.forward_context import get_forward_context
+@@ -78,12 +79,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+     def _extract_metadata(self, num_tokens):
+         """Extract forward-context metadata into plain tensors.
+ 
+-        Dynamo graph-breaks naturally on ``get_forward_context()``; no
+-        ``@dynamo.disable`` needed.
++        Explicitly dynamo-disabled: with Qwen4Exp (multi-group hybrid cache,
++        2-D load_indices_tensor) tracing the ``assert cg is not None`` in
++        ``_resolve_state_indices`` on the decode path trips a torch._dynamo
++        internal assertion (``jump: instruction_pointer is None``). Running
++        the metadata extraction eagerly is a graph break either way.
+         """
+         forward_context = get_forward_context()
+         attn_metadata = forward_context.attn_metadata
+-        if attn_metadata is None:
++        # Empty placeholder states (memory-profiling run in lazy mode) => no core attention.
++        if attn_metadata is None or self.kv_cache[0].numel() == 0:
+             return (False, None, None, None, None, None, None, 0, 0, 0, 0, None)
+ 
+         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
+@@ -113,9 +118,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
+             initial_state = ssm_state[state_indices].contiguous()
+             if has_initial_state is not None:
+-                # Avoid scatter_nd from boolean indexing
+-                mask = has_initial_state.bool().view(-1, 1, 1, 1).to(initial_state.dtype)
+-                initial_state = initial_state * mask
++                # NaN-safe masking (torch.where, not multiply: a stale NaN/Inf
++                # slot from a finished request must not leak into a fresh one).
++                mask = has_initial_state.bool().view(-1, 1, 1, 1)
++                initial_state = torch.where(mask, initial_state, torch.zeros_like(initial_state))
+ 
+         return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
+                 num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
+diff --git a/vllm_gaudi/models/qwen4_exp.py b/vllm_gaudi/models/qwen4_exp.py
+new file mode 100644
+index 0000000..a790e2d
+--- /dev/null
++++ b/vllm_gaudi/models/qwen4_exp.py
+@@ -0,0 +1,1283 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU implementation of Qwen4Exp (Qwen3.8-Flash-Next).
++
++Upstream vLLM ships a CUDA/ROCm-only implementation (Triton hyper-connection
++kernels, FlashAttention-based sparse QSA attention, Triton PLE kernels, CUDA
++top-k ops).  This module re-implements the model with pure PyTorch on top of
++the plugin's existing HPU building blocks:
++
++* linear-attention layers  -> ``HPUGatedDeltaNetAttention`` (same layout as Qwen3.5)
++* full-attention layers    -> ``Qwen3NextAttention`` + HPU paged attention.
++                              The Qwen Sparse Attention (QSA) indexer selects
++                              the top ``indexer_budget`` (=2048) tokens; for
++                              contexts up to that budget dense attention is
++                              mathematically identical.  Beyond the budget we
++                              currently run dense attention (documented
++                              approximation, see docs/).
++* hyper-connections        -> upstream pure-torch ``GatedResidual``
++* PLE n-gram layer         -> HPU-native lookup table (uint8 storage + LUT
++                              dequant), int32 bit-exact hashing, dilated
++                              depthwise conv with per-request state kept in
++                              the hybrid Mamba cache (compact GDN slots).
++* MoE                      -> ``Qwen3NextSparseMoeBlock`` (HPU fused MoE, FP8).
++"""
++from collections.abc import Iterable, Sequence
++from itertools import islice
++import math
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
++                              tensor_model_parallel_all_reduce)
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.layers.layernorm import GemmaRMSNorm
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.abstract import MambaBase
++from vllm.model_executor.layers.mamba.mamba_utils import (MambaStateCopyFunc, MambaStateCopyFuncCalculator,
++                                                          MambaStateCopyFuncsByType, MambaStateDtypeCalculator,
++                                                          MambaStateShapeCalculator)
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
++from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts, MultiModalEmbeddings,
++                                                   SupportsLoRA, SupportsMRoPE, SupportsPP)
++from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5Model
++from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextMLP, Qwen3NextSparseMoeBlock
++from vllm.model_executor.models.qwen3_vl import (Qwen3_VisionTransformer, Qwen3VLDummyInputsBuilder,
++                                                 Qwen3VLMultiModalProcessor, Qwen3VLProcessingInfo)
++from vllm.model_executor.models.utils import (AutoWeightsLoader, StageMissingLayer, WeightsMapper,
++                                              extract_layer_index, make_empty_intermediate_tensors_factory,
++                                              make_layers, maybe_fuse_shared_experts, maybe_prefix)
++from vllm.models.qwen4_exp.common.hyperconnection import GatedResidual, HyperConnectionConfig
++from vllm.models.qwen4_exp.config import Qwen4ExpConfig
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import MultiModalFeatureSpec
++from vllm.sequence import IntermediateTensors
++from vllm.tokenizers.registry import cached_tokenizer_from_config
++from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import MambaSpec
++
++from vllm_gaudi.models.qwen3_5 import HPUGatedDeltaNetAttention
++from vllm_gaudi.models.qwen4_exp_groups import FORWARDS as _GROUP_FORWARDS
++from vllm_gaudi.ops.hpu_gdn_pytorch import hpu_fused_gdn_gating, _l2norm_last_dim, _GDN_COMPUTE_DTYPE
++from vllm_gaudi.models.qwen4_exp_ngram_hash import NgramHasher, make_layer_multipliers, make_vocab_layout
++
++logger = init_logger(__name__)
++
++import os as _os
++import types
++import sys as _sys
++# Marker files control debug/tuning switches (env vars do not reach HPU workers). A marker is looked up
++# first in the model directory (so side experiments on other checkpoints never affect a real launch), then
++# under /work. ``configure_markers(model_dir)`` is called at model construction; module-level defaults come
++# from /work only.
++_MARKER_DIRS: list = ["/work"]
++
++
++def _marker(name: str) -> bool:
++    return any(_os.path.exists(_os.path.join(d, name)) for d in _MARKER_DIRS)
++
++
++def _marker_int(name: str, default: int) -> int:
++    for d in _MARKER_DIRS:
++        f = _os.path.join(d, name)
++        if _os.path.exists(f):
++            return int(open(f).read().strip())
++    return default
++
++
++def configure_markers(model_dir: str | None) -> None:
++    """Re-resolve all marker-controlled switches for this launch (model dir first, then /work)."""
++    global _MARKER_DIRS, _DEBUG, _DEBUG_DEEP, _PLE_GRAPH_BREAKS, _PLE_EAGER_STATE_WRITE, _LAYERS_PER_REGION, _FAST_DECODE
++    global _DENSE_REPLICATED, _ABL
++    if model_dir and _os.path.isdir(model_dir):
++        _MARKER_DIRS = [model_dir] if any(f.startswith("QWEN4_") for f in _os.listdir(model_dir)) else ["/work"]
++    _DEBUG = _marker("QWEN4_DEBUG")
++    _DEBUG_DEEP = _marker("QWEN4_DEBUG_DEEP")
++    _PLE_GRAPH_BREAKS = _marker("QWEN4_PLE_GRAPH_BREAKS")
++    # Deferred writes (state tensors returned from the compiled region and written by the caller) give wrong
++    # results at batch >= 2 on HPU (rows of the second request corrupted); eager in-region writes are the default.
++    _PLE_EAGER_STATE_WRITE = not _marker("QWEN4_PLE_DEFERRED_WRITE")
++    _FAST_DECODE = _marker("QWEN4_FAST_DECODE")  # opt-in: no gated gain, crashes with per-layer frames at TP4
++    _LAYERS_PER_REGION = _marker_int("QWEN4_LAYERS_PER_REGION", 1)
++    _DENSE_REPLICATED = _marker("QWEN4_DENSE_REPLICATED")
++    _ABL = {k: _marker(f"QWEN4_ABL_NO_{k}") for k in ("MOE", "GDN", "ATTN", "HC", "PLE")}
++    import sys as _sys
++    print(f"[QWEN4] markers from {_MARKER_DIRS}: debug={_DEBUG} deep={_DEBUG_DEEP} ple_breaks={_PLE_GRAPH_BREAKS} "
++          f"eager_write={_PLE_EAGER_STATE_WRITE} fast_decode={_FAST_DECODE} layers_per_region={_LAYERS_PER_REGION} dense={_DENSE_REPLICATED} "
++          f"abl={_ABL}", file=_sys.stderr, flush=True)
++
++
++_DEBUG = _os.path.exists("/work/QWEN4_DEBUG")  # file flag: env vars do not reach HPU workers
++_DEBUG_DEEP = _os.path.exists("/work/QWEN4_DEBUG_DEEP")
++# Tunables via marker files (env vars do not reach HPU workers): see docs/05_PERF.md
++_PLE_GRAPH_BREAKS = _os.path.exists("/work/QWEN4_PLE_GRAPH_BREAKS")
++_PLE_EAGER_STATE_WRITE = not _os.path.exists("/work/QWEN4_PLE_DEFERRED_WRITE")
++_FAST_DECODE = _os.path.exists("/work/QWEN4_FAST_DECODE")
++_LAYERS_PER_REGION = int(open("/work/QWEN4_LAYERS_PER_REGION").read().strip()) if _os.path.exists("/work/QWEN4_LAYERS_PER_REGION") else 1
++# Dense-replicated mode: build every non-expert module with TP=1 semantics (full weights on every rank,
++# no per-layer all-reduce for attention/GDN); only the routed experts stay sharded (EP) with one
++# all-reduce per MoE layer. Costs ~+4.5 GB weights per rank at TP4; removes ~48 collectives per step.
++_DENSE_REPLICATED = _os.path.exists("/work/QWEN4_DENSE_REPLICATED")
++
++
++class _tp1_context:
++    """Temporarily make the TP-size/rank helpers report (1, 0) in the modules that build dense layers."""
++    _targets = ("vllm.model_executor.layers.linear", "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
++                "vllm.model_executor.layers.mamba.gdn.base", "vllm.model_executor.layers.attention.attention",
++                "vllm.model_executor.models.qwen3_next", "vllm.model_executor.layers.mamba.abstract",
++                "vllm.model_executor.layers.layernorm", "vllm_gaudi.models.qwen3_5", "vllm.distributed",
++                "vllm.distributed.parallel_state")
++
++    def __init__(self, targets=None):
++        self._targets_override = targets
++
++    def __enter__(self):
++        import importlib
++        self._saved = []
++        for name in (self._targets_override or self._targets):
++            try:
++                mod = importlib.import_module(name)
++            except Exception:
++                continue
++            for fn, val in (("get_tensor_model_parallel_world_size", 1), ("get_tensor_model_parallel_rank", 0)):
++                if hasattr(mod, fn):
++                    self._saved.append((mod, fn, getattr(mod, fn)))
++                    setattr(mod, fn, (lambda v=val: v))
++        return self
++
++    def __exit__(self, *a):
++        for mod, fn, orig in self._saved:
++            setattr(mod, fn, orig)
++        return False
++
++
++def _load_ctx():
++    """During weight loading, sharded_weight_loader (GDN A_log/dt_bias/conv) reads the TP rank at call time."""
++    import contextlib
++    if not _DENSE_REPLICATED:
++        return contextlib.nullcontext()
++    return _tp1_context(targets=("vllm.model_executor.model_loader.weight_utils",
++                                 "vllm.model_executor.layers.mamba.mamba_mixer2"))
++
++
++# Ablation switches for timing experiments only (outputs are garbage when set)
++_ABL = {k: _os.path.exists(f"/work/QWEN4_ABL_NO_{k}") for k in ("MOE", "GDN", "ATTN", "HC", "PLE")}
++if any(_ABL.values()):
++    import sys as _sys
++    print(f"[QWEN4] ABLATION active: {_ABL}", file=_sys.stderr, flush=True)
++if _DEBUG:
++    import sys as _sys
++    print(f"[QWEN4_DEBUG] probes enabled at import (pid {_os.getpid()})", file=_sys.stderr, flush=True)
++if not _os.path.exists("/work/QWEN4_NO_FAST_TOPK"):
++    from vllm_gaudi.ops.hpu_topk_topp import install as _install_fast_topk
++    _install_fast_topk()
++if _os.path.exists("/work/QWEN4_DEBUG_GB"):
++    torch._logging.set_logs(graph_breaks=True, recompiles=True)
++
++
++@torch._dynamo.disable
++def _dbg(tag: str, *tensors) -> None:
++    """NaN/absmax probe (QWEN4_DEBUG=1), rank 0 only, eager."""
++    if not _DEBUG:
++        return
++    try:
++        if get_tensor_model_parallel_rank() != 0:
++            return
++    except Exception:
++        pass
++    parts = []
++    for t in tensors:
++        if t is None or not isinstance(t, torch.Tensor) or t.numel() == 0:
++            parts.append("None")
++            continue
++        tf = t.detach()
++        if tf.is_floating_point():
++            parts.append(f"nan={int(torch.isnan(tf).sum())} inf={int(torch.isinf(tf).sum())} absmax={float(tf.abs().max()):.3g} shape={tuple(tf.shape)}")
++        else:
++            parts.append(f"min={int(tf.min())} max={int(tf.max())} shape={tuple(tf.shape)} vals={tf.flatten()[:8].tolist()}")
++    import sys as _sys
++    print("[QWEN4_DEBUG] " + tag + ": " + " | ".join(parts), file=_sys.stderr, flush=True)
++
++_IGNORED_SUFFIXES = [".bias", "_bias", ".k_scale", "_k_scale", ".v_scale", "_v_scale", "_weight_scale", "_input_scale"]
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++class GroupedNorm(nn.Module):
++    """Gemma-style RMSNorm applied independently to each ``group_size`` chunk."""
++
++    def __init__(self, hidden_size: int, eps: float, group_size: int, dtype: torch.dtype) -> None:
++        super().__init__()
++        assert hidden_size % group_size == 0
++        self.eps = eps
++        self.group_size = group_size
++        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        in_dtype = x.dtype
++        xf = x.float()
++        g = xf.unflatten(-1, (xf.shape[-1] // self.group_size, self.group_size))
++        var = g.square().mean(dim=-1, keepdim=True)
++        normed = (g * torch.rsqrt(var + self.eps)).flatten(-2)
++        return (normed * (1.0 + self.weight.float())).to(in_dtype)
++
++
++@torch._dynamo.disable
++def _save_state(passthrough: torch.Tensor, state: torch.Tensor, indices: torch.Tensor,
++                values: torch.Tensor) -> torch.Tensor:
++    """index_copy_ outside of torch.compile (HPU compile drops aliased in-place index_copy_)."""
++    state.index_copy_(0, indices, values.to(dtype=state.dtype))
++    return passthrough
++
++
++@torch._dynamo.disable
++def _save_state_prefill(passthrough: torch.Tensor, conv_state: torch.Tensor, tok_state: torch.Tensor,
++                        state_indices: torch.Tensor, hist: torch.Tensor, tokseq: torch.Tensor, qsl: torch.Tensor,
++                        B: int, conv_state_len: int, ctx_len: int) -> torch.Tensor:
++    """Prefill state write done EAGERLY (gather index + index_copy_).
++
++    Inside the compiled region the per-request length gather silently used the state-slot index instead of
++    ``qsl`` for every prefill after the first traced one (verified with probes on the real and the tiny
++    model; a standalone replica compiles correctly). All index math is therefore done here, outside compile,
++    from the eagerly resolved metadata.
++    """
++    num_slots = conv_state.shape[0]
++    safe_idx = torch.remainder(state_indices, num_slots).long()
++    valid = state_indices >= 0
++    qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    dev = hist.device
++    offs = torch.arange(conv_state_len, device=dev, dtype=torch.long)
++    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
++    new_conv = torch.gather(hist, 1, gather_idx)
++    toffs = torch.arange(ctx_len, device=dev, dtype=torch.long)
++    new_tok = torch.gather(tokseq, 1, qlens.view(B, 1) + toffs.view(1, -1))
++    upd = valid & (qlens > 0)
++    new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
++    new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
++    if _DEBUG_DEEP: _dbg("ple.write", qsl, safe_idx, upd.to(torch.int32), new_tok, new_conv)
++    conv_state.index_copy_(0, safe_idx, new_conv)
++    tok_state.index_copy_(0, safe_idx, new_tok)
++    if _DEBUG_DEEP: _dbg("ple.readback", tok_state.index_select(0, safe_idx), conv_state.index_select(0, safe_idx))
++    return passthrough
++
++
++@torch._dynamo.disable
++def _dbg_rows(tag: str, t: torch.Tensor) -> None:
++    """Per-row (dim 0) nan count / absmax, rank 0 only."""
++    if not _DEBUG:
++        return
++    try:
++        if get_tensor_model_parallel_rank() != 0:
++            return
++    except Exception:
++        pass
++    import sys as _sys
++    tf = t.detach().float()
++    rows = []
++    for r in range(min(tf.shape[0], 4)):
++        x = tf[r]
++        rows.append(f"r{r}: nan={int(torch.isnan(x).sum())} absmax={float(x.abs().max()):.3g} mean={float(x.mean()):.3g}")
++    print(f"[QWEN4_DEBUG] {tag} shape={tuple(t.shape)} " + " | ".join(rows), file=_sys.stderr, flush=True)
++
++
++# ---------------------------------------------------------------------------
++# PLE (n-gram) layer
++# ---------------------------------------------------------------------------
++class HpuNgramTable(nn.Module):
++    """TP-sharded FP8 n-gram embedding table stored as raw uint8 with LUT dequant.
++
++    Gaudi2 interprets ``float8_e4m3fn`` bit patterns differently from CPU
++    (e4m3 *fnuz*), so instead of casting we keep the checkpoint bytes and
++    dequantize through a 256-entry lookup table computed on CPU.
++    """
++
++    def __init__(self, padded_vocab_size: int, head_dim: int, split_ngram_parts: int, org_vocab_size: int) -> None:
++        super().__init__()
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.tp_rank = get_tensor_model_parallel_rank()
++        self.padded_vocab_size = padded_vocab_size
++        self.org_vocab_size = org_vocab_size
++        self.head_dim = head_dim
++        self.split_ngram_parts = split_ngram_parts
++        assert padded_vocab_size % self.tp_size == 0
++        self.rows_per_rank = padded_vocab_size // self.tp_size
++        self.vocab_start = self.tp_rank * self.rows_per_rank
++        self.vocab_end = self.vocab_start + self.rows_per_rank
++        self.weight = nn.Parameter(torch.zeros(self.rows_per_rank, head_dim, dtype=torch.uint8), requires_grad=False)
++        self.weight_scale = nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
++        # Build on CPU (torch semantics: 0x7F/0xFF = NaN -> 0). Built on HPU, those codes decode to +-inf.
++        lut = torch.arange(256, dtype=torch.uint8, device="cpu").view(torch.float8_e4m3fn).to(torch.float32)
++        lut = torch.nan_to_num(lut, nan=0.0, posinf=0.0, neginf=0.0)
++        self.register_buffer("lut", lut.to(torch.bfloat16), persistent=False)
++        self._loaded_rows = 0
++
++    def load_shard(self, shard_index: int, loaded_weight: torch.Tensor) -> None:
++        shard_size = (self.org_vocab_size + self.split_ngram_parts - 1) // self.split_ngram_parts
++        ckpt_start = shard_index * shard_size
++        ckpt_end = ckpt_start + loaded_weight.shape[0]
++        lo = max(ckpt_start, self.vocab_start)
++        hi = min(ckpt_end, self.vocab_end)
++        if lo >= hi:
++            return
++        src = loaded_weight[lo - ckpt_start:hi - ckpt_start]
++        if src.dtype != torch.uint8:
++            src = src.view(torch.uint8)
++        with torch.no_grad():
++            self.weight.data[lo - self.vocab_start:hi - self.vocab_start].copy_(src)
++        self._loaded_rows += hi - lo
++
++    def forward(self, ids: torch.Tensor) -> torch.Tensor:
++        """ids int32 [..., H] (global rows) -> bf16 [..., H*head_dim]"""
++        if self.tp_size > 1:
++            mask = (ids >= self.vocab_start) & (ids < self.vocab_end)
++            local = torch.where(mask, ids - self.vocab_start, torch.zeros_like(ids))
++        else:
++            mask = None
++            local = ids
++        flat = local.reshape(-1).long().clamp_(0, self.rows_per_rank - 1)
++        rows = self.weight.index_select(0, flat)  # [N, D] uint8
++        vals = self.lut.index_select(0, rows.reshape(-1).long().clamp_(0, 255)).reshape(rows.shape)  # bf16
++        vals = vals.reshape(*ids.shape, self.head_dim)
++        if mask is not None:
++            vals = vals * mask.unsqueeze(-1).to(vals.dtype)
++        vals = vals.flatten(-2)
++        if self.tp_size > 1:
++            vals = tensor_model_parallel_all_reduce(vals)
++        return vals * self.weight_scale.to(vals.dtype)
++
++
++class HpuQwen4ExpPLELayer(nn.Module, MambaBase):
++    """Position-Learning-Enhancement layer with n-gram embeddings and a dilated short conv.
++
++    Per-request state (kept in the hybrid Mamba cache, one compact slot per request):
++      * conv_state  [conv_state_len, hc_count*hidden]   (bf16)  previous ``normalized`` rows
++      * token_state [ngram_size-1]                       (int32) previous token ids (EOS-initialised)
++    """
++
++    def __init__(self, config: Qwen4ExpTextConfig, vllm_config: VllmConfig, layer_idx: int, ple_dense_layer_id: int,
++                 prefix: str) -> None:
++        super().__init__()
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        self.model_config = model_config
++        self.cache_config = cache_config
++        self.prefix = prefix
++        self.layer_idx = layer_idx
++        self.hidden_size = int(config.hidden_size)
++        self.hc_count = int(config.hc_count)
++        self.hc_hidden_size = self.hidden_size * self.hc_count
++        self.conv_kernel_size = int(config.ple_conv_kernel_size)
++        self.dilation = int(config.ngram_size)
++        self.conv_state_len = (self.conv_kernel_size - 1) * self.dilation
++        self.ngram_size = int(config.ngram_size)
++        self.heads_per_ngram = int(config.heads_per_ngram)
++        self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
++        self.ctx_len = self.ngram_size - 1
++        self.embed_dim = int(config.ple_embed_dim)
++        self.head_dim = self.embed_dim // self.ngram_heads
++        self.eos_token_id = int(config.eos_token_id)
++        self.dtype = model_config.dtype
++        self.cache_group_idx = None  # set by the HPU model runner
++
++        multipliers = make_layer_multipliers(ngram_size=self.ngram_size,
++                                             unigram_vocab_size=int(config.vocab_size),
++                                             seed=int(getattr(config, "seed", 1234)),
++                                             ple_dense_layer_id=ple_dense_layer_id)
++        sizes, offsets, total = make_vocab_layout(ngram_vocab_size_base=int(config.ngram_vocab_size_base),
++                                                  ngram_heads=self.ngram_heads,
++                                                  ple_dense_layer_id=ple_dense_layer_id)
++        # int64 values > 2**31 cannot live on HPU (lazy-mode init runs on device): keep as a Python list.
++        self._expected_multipliers = list(multipliers)
++        divisor = int(config.make_ngram_vocab_size_divisible_by)
++        padded_vocab = ((total + divisor - 1) // divisor) * divisor
++        self.hasher = NgramHasher(multipliers, sizes, offsets, self.heads_per_ngram, self.ngram_size)
++        self.ngram_table = HpuNgramTable(padded_vocab, self.head_dim, int(getattr(config, "split_ngram_parts", 512)),
++                                         total)
++
++        self.key_proj = ReplicatedLinear(self.embed_dim, self.hc_hidden_size, bias=False, quant_config=quant_config,
++                                         prefix=f"{prefix}.key_proj", return_bias=False)
++        self.value_proj = ReplicatedLinear(self.embed_dim, self.hidden_size, bias=False, quant_config=quant_config,
++                                           prefix=f"{prefix}.value_proj", return_bias=False)
++        self.norm_key = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.norm_query = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.norm_conv = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.conv1d = nn.Conv1d(self.hc_hidden_size, self.hc_hidden_size, self.conv_kernel_size,
++                                groups=self.hc_hidden_size, bias=False, dtype=self.dtype)
++        nn.init.zeros_(self.conv1d.weight)
++        self.conv1d.weight._no_reinit = True
++        self.kv_cache = (torch.tensor([]), torch.tensor([]))
++        compilation_config = get_current_vllm_config().compilation_config
++        if prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        compilation_config.static_forward_context[prefix] = self
++
++    # --- MambaBase interface -------------------------------------------------
++    @property
++    def mamba_type(self) -> MambaAttentionBackendEnum:
++        return MambaAttentionBackendEnum.SHORT_CONV
++
++    @property
++    def is_kv_cache_tp_replicated(self) -> bool:
++        return True
++
++    def get_attn_backend(self):
++        from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionBackend
++        return ShortConvAttentionBackend
++
++    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
++        return ple_state_dtypes(self.model_config.dtype)
++
++    def get_state_shape(self) -> Sequence[tuple[int, ...]]:
++        return ple_state_shapes(self.conv_state_len, self.hc_hidden_size, self.ctx_len)
++
++    # --- forward ---------------------------------------------------------------
++    def _state_indices(self, attn_metadata):
++        indices = attn_metadata.load_indices_tensor
++        if indices is not None and indices.dim() > 1:
++            cg = self.cache_group_idx
++            assert cg is not None, "cache_group_idx not set for PLE layer"
++            indices = indices.index_select(0, cg.view(1)).squeeze(0)
++        return indices
++
++    def _extract_metadata(self, input_ids: torch.Tensor, num_tokens: int):
++        """Extraction of forward-context metadata into plain tensors / ints (natural dynamo graph break)."""
++        attn_metadata = get_forward_context().attn_metadata
++        conv_state, tok_state = self.kv_cache[0], self.kv_cache[1]
++        have_state = attn_metadata is not None and conv_state.numel() > 0
++        is_prompt = bool(getattr(attn_metadata, "is_prompt", False)) if attn_metadata is not None else False
++        state_indices = self._state_indices(attn_metadata) if have_state else None
++        qsl = attn_metadata.query_start_loc_p if (have_state and is_prompt) else None
++        his = attn_metadata.has_initial_states_p if (have_state and is_prompt) else None
++        pm = getattr(attn_metadata, "padding_mask_flat", None) if (have_state and is_prompt) else None
++        if input_ids.dim() == 2:
++            B, L = int(input_ids.shape[0]), int(input_ids.shape[1])
++        else:
++            if qsl is not None:
++                B = int(qsl.numel()) - 1
++            elif state_indices is not None:
++                B = int(state_indices.numel())
++            else:
++                B = num_tokens
++            L = num_tokens // max(B, 1)
++        return (have_state, is_prompt, state_indices, conv_state, tok_state, qsl, his, pm, B, L)
++
++    def _conv_out(self, hist: torch.Tensor, length: int) -> torch.Tensor:
++        """hist [B, conv_state_len + length, C] -> silu(dilated depthwise conv) [B, length, C]"""
++        w = self.conv1d.weight.view(self.hc_hidden_size, self.conv_kernel_size).to(hist.dtype)
++        out = None
++        for k in range(self.conv_kernel_size):
++            term = hist[:, k * self.dilation:k * self.dilation + length, :] * w[:, k]
++            out = term if out is None else out + term
++        return F.silu(out)
++
++    def get_meta(self, input_ids: torch.Tensor):
++        """Resolve forward-context metadata for this layer EAGERLY (call outside compiled regions).
++
++        Tensors read from the global forward context inside a compiled region were baked as constants by
++        HPU torch.compile (per-request lengths / state slots of the first traced request were reused for
++        later requests → state written from padding). Passing them as explicit inputs avoids that.
++        """
++        return self._extract_metadata(input_ids, int(input_ids.numel()))
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, state_writes: list | None = None,
++                meta=None, fast: bool = False) -> torch.Tensor:
++        orig_shape = hidden_states.shape
++        C = self.hc_hidden_size
++        h2 = hidden_states.reshape(-1, C)
++        num_tokens = h2.shape[0]
++        device = h2.device
++
++        if meta is None:
++            meta = self._extract_metadata(input_ids, num_tokens)
++        (have_state, is_prompt, state_indices, conv_state, tok_state, qsl, his, pm, B, L) = meta
++
++        tokens = input_ids.reshape(B, L).to(torch.int32)
++        eos = self.eos_token_id
++        pending = None
++
++        if have_state:
++            num_slots = conv_state.shape[0]
++            safe_idx = torch.remainder(state_indices, num_slots).long()
++            valid = (state_indices >= 0)
++            init_conv = conv_state.index_select(0, safe_idx)  # [B, S, C]
++            init_tok = tok_state.index_select(0, safe_idx)  # [B, 2]
++            if is_prompt:
++                if his is None:
++                    use_init = valid
++                else:
++                    if his.numel() < B:
++                        his = F.pad(his, (0, B - his.numel()), value=0)
++                    use_init = his[:B].bool() & valid
++            else:
++                use_init = valid
++            # NaN-safe masking (a stale NaN/Inf slot must not leak into a fresh request)
++            init_conv = torch.where(use_init.view(B, 1, 1), init_conv, torch.zeros_like(init_conv))
++            init_tok = torch.where(use_init.view(B, 1), init_tok, torch.full_like(init_tok, eos))
++        else:
++            init_conv = torch.zeros(B, self.conv_state_len, C, dtype=h2.dtype, device=device)
++            init_tok = torch.full((B, self.ctx_len), eos, dtype=torch.int32, device=device)
++
++        # ---- n-gram ids ---------------------------------------------------------
++        tokseq = torch.cat([init_tok, tokens], dim=1)  # [B, ctx+L]
++        t0 = tokseq[:, self.ctx_len:self.ctx_len + L]
++        t1 = tokseq[:, self.ctx_len - 1:self.ctx_len - 1 + L]
++        t2 = tokseq[:, self.ctx_len - 2:self.ctx_len - 2 + L]
++        eos_t = torch.full_like(t2, eos)
++        t2 = torch.where(t1 == eos, eos_t, t2)
++        t0 = torch.clamp(t0, min=0)  # padded rows may carry -1
++        ids = self.hasher(t0, t1, t2)  # [B, L, H] int32
++        emb = self.ngram_table(ids).reshape(num_tokens, self.embed_dim).to(h2.dtype)
++        if _DEBUG_DEEP: _dbg("ple.in", h2, state_indices, init_tok, init_conv, t0, t1, t2, ids, emb)
++        if _PLE_GRAPH_BREAKS and not fast:
++            # Deliberate graph break (partition proven correct when the un-broken region miscompiled).
++            torch._dynamo.graph_break()
++
++        # ---- gate / value ---------------------------------------------------------
++        key = self.key_proj(emb)
++        value = self.value_proj(emb)
++        key = self.norm_key(key).reshape(num_tokens, self.hc_count, self.hidden_size)
++        query = self.norm_query(h2).reshape(num_tokens, self.hc_count, self.hidden_size)
++        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
++        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
++        gated_value = gate * value.unsqueeze(-2)  # [T, hc, H]
++        normalized = self.norm_conv(gated_value.flatten(-2))  # [T, C]
++
++        # ---- dilated short conv with state --------------------------------------
++        x = normalized.reshape(B, L, C)
++        hist = torch.cat([init_conv.to(x.dtype), x], dim=1)  # [B, S+L, C]
++        conv_out = self._conv_out(hist, L)  # [B, L, C]
++
++        if have_state and is_prompt:
++            if pm is not None and pm.numel() == num_tokens:
++                conv_out = conv_out * pm.view(B, L, 1).to(conv_out.dtype)
++            # Always eager: the in-graph length gather used the wrong index (see _save_state_prefill).
++            conv_out = _save_state_prefill(conv_out, conv_state, tok_state, state_indices, hist, tokseq, qsl,
++                                           B, self.conv_state_len, self.ctx_len)
++        elif have_state:
++            new_conv = hist[:, L:L + self.conv_state_len, :]
++            new_tok = tokseq[:, L:L + self.ctx_len]
++            upd = valid
++            new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
++            new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
++            if (_PLE_EAGER_STATE_WRITE or state_writes is None) and not fast:
++                conv_out = _save_state(conv_out, conv_state, safe_idx, new_conv)
++                conv_out = _save_state(conv_out, tok_state, safe_idx, new_tok)
++                if _DEBUG_DEEP: _dbg("ple.readback", tok_state.index_select(0, safe_idx), conv_state.index_select(0, safe_idx))
++            else:
++                # Deferred: the caller applies these index_copy_ writes after the compiled region
++                # returns (in-graph index_put is silently mis-ordered/dropped by HPU torch.compile,
++                # and an eager write inside the region costs a graph break). The tensors are returned
++                # explicitly as graph outputs (list mutation inside the region is not relied upon).
++                pending = (safe_idx, new_conv.to(conv_state.dtype), new_tok.to(tok_state.dtype))
++
++        out = gated_value.flatten(-2) + conv_out.reshape(num_tokens, C)
++        if _DEBUG_DEEP: _dbg("ple.out", gate, gated_value, normalized, conv_out, out)
++        if _PLE_GRAPH_BREAKS and not fast:
++            torch._dynamo.graph_break()
++        if state_writes is not None:
++            return out.reshape(orig_shape), pending
++        return out.reshape(orig_shape)
++
++    # --- weights ---------------------------------------------------------------
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loaded: set[str] = set()
++        regular: list[tuple[str, torch.Tensor]] = []
++        shard_prefix = "ple_embedding.ngram_embedding.shard_"
++        for name, w in weights:
++            leaf = name.rsplit(".", 1)[-1]
++            if leaf.startswith("hashstats_") or leaf == "token_lookup":
++                continue
++            if name == "ple_embedding.layer_multipliers":
++                got = w.to(torch.long).tolist()
++                if got != self._expected_multipliers:
++                    raise ValueError(f"PLE multipliers mismatch: ckpt {got} vs computed {self._expected_multipliers}")
++                loaded.add("layer_multipliers")
++                continue
++            if name in ("ple_embedding.ngram_heads_vocab_sizes", "ple_embedding.ngram_heads_offsets"):
++                continue
++            if name == "ple_embedding.ngram_embedding.weight_scale":
++                with torch.no_grad():
++                    self.ngram_table.weight_scale.data.copy_(w.reshape(1).to(torch.bfloat16))
++                loaded.add("ngram_table.weight_scale")
++                continue
++            if name.startswith(shard_prefix) and name.endswith(".weight"):
++                idx_text = name[len(shard_prefix):-len(".weight")]
++                if idx_text.isdigit():
++                    self.ngram_table.load_shard(int(idx_text), w)
++                    loaded.add("ngram_table.weight")
++                    continue
++            regular.append((name, w))
++        if regular:
++            loaded.update(AutoWeightsLoader(self).load_weights(regular))
++        return loaded
++
++
++def ple_state_dtypes(model_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
++    return (model_dtype, torch.int32)
++
++
++def ple_state_shapes(conv_state_len: int, hc_hidden: int, ctx_len: int) -> tuple[tuple[int, ...], ...]:
++    return ((conv_state_len, hc_hidden), (ctx_len, ))
++
++
++# ---------------------------------------------------------------------------
++# Attention (dense fallback for QSA) with indexer weights kept loadable
++# ---------------------------------------------------------------------------
++class HpuQSAIndexerWeights(nn.Module):
++    """Holds the QSA indexer parameters so the checkpoint loads cleanly.
++
++    The sparse top-k selection itself is not executed on HPU (dense attention
++    is used); keeping the weights allows a future sparse implementation.
++    """
++
++    def __init__(self, config: Qwen4ExpTextConfig, quant_config, prefix: str) -> None:
++        super().__init__()
++        n_heads = int(config.indexer_n_heads)
++        kv_heads = int(config.indexer_kv_heads)
++        head_dim = int(config.indexer_head_dim)
++        self.index_qk_proj = ReplicatedLinear(int(config.hidden_size), (n_heads + kv_heads) * head_dim, bias=False,
++                                              quant_config=quant_config, prefix=f"{prefix}.index_qk_proj")
++        self.q_layernorm = GemmaRMSNorm(head_dim, eps=float(config.rms_norm_eps))
++        self.k_layernorm = GemmaRMSNorm(head_dim, eps=float(config.rms_norm_eps))
++
++
++# ---------------------------------------------------------------------------
++# Decoder layer
++# ---------------------------------------------------------------------------
++class HpuQwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
++
++    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        config = vllm_config.model_config.hf_text_config
++        self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
++
++
++class HpuQwen4ExpGDN(HPUGatedDeltaNetAttention):
++    """Plugin GDN layer + a graph-break-free single-token decode path.
++
++    ``forward_decode`` takes the state slots as an explicit input, reads the conv/SSM state in-graph and
++    returns the new state instead of writing it (the caller writes it in the *next* compiled region, so no
++    tensor is both read and written inside one graph - the pattern HPU torch.compile mishandles).
++    """
++
++    def forward_decode(self, hidden_states: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor,
++                       slots: torch.Tensor):
++        orig_shape = hidden_states.shape
++        x = hidden_states.reshape(-1, hidden_states.size(-1))
++        B = x.shape[0]
++        if hasattr(self, 'in_proj_qkv'):
++            mixed_qkv, _ = self.in_proj_qkv(x)
++            ba, _ = self.in_proj_ba(x)
++            z, _ = self.in_proj_z(x)
++        else:
++            mixed_qkvz, _ = self.in_proj_qkvz(x)
++            ba, _ = self.in_proj_ba(x)
++            mixed_qkv, z = mixed_qkvz.split([self.qkv_size, self.z_size], dim=-1)
++        z = z.reshape(B, -1, self.head_v_dim)
++        b, a = ba.chunk(2, dim=-1)
++        g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)  # [1,B,HV] fp32 / b-dtype
++        # --- depthwise causal conv with state (layout [slots, K-1, dim]) ---
++        w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))  # [dim, K]
++        cs = conv_state.index_select(0, slots)  # [B, K-1, dim]
++        seq = torch.cat([cs, mixed_qkv.to(cs.dtype).unsqueeze(1)], dim=1)  # [B, K, dim]
++        new_conv = seq[:, 1:, :]
++        wf = w.t().unsqueeze(0).float()  # [1, K, dim]
++        conv = (seq.float() * wf).sum(dim=1)  # [B, dim] fp32
++        if self.conv1d.bias is not None:
++            conv = conv + self.conv1d.bias.float()
++        conv = F.silu(conv).to(x.dtype)
++        query, key, value = self.rearrange_mixed_qkv(conv)  # [1,B,H,dk] [1,B,H,dk] [1,B,HV,dv]
++        cd = _GDN_COMPUTE_DTYPE
++        qf = query.reshape(B, -1, self.head_k_dim).to(cd)
++        kf = key.reshape(B, -1, self.head_k_dim).to(cd)
++        vf = value.reshape(B, -1, self.head_v_dim).to(cd)
++        H, HV = qf.shape[1], vf.shape[1]
++        if H != HV:
++            qf = qf.repeat_interleave(HV // H, dim=1)
++            kf = kf.repeat_interleave(HV // H, dim=1)
++        qf = _l2norm_last_dim(qf)
++        kf = _l2norm_last_dim(kf)
++        gf = g.reshape(B, HV).to(torch.float32)
++        bf = beta.reshape(B, HV).to(cd)
++        h = ssm_state.index_select(0, slots).to(cd)  # [B, HV, V, K]
++        h = h * torch.exp(gf).to(cd).unsqueeze(-1).unsqueeze(-1)
++        proj = torch.matmul(h, kf.unsqueeze(-1)).squeeze(-1)  # [B,HV,V]
++        v_new = (vf - proj) * bf.unsqueeze(-1)
++        h = h + v_new.unsqueeze(-1) * kf.unsqueeze(2)
++        scale = self.head_k_dim ** -0.5
++        out = torch.matmul(h, (qf * scale).unsqueeze(-1)).squeeze(-1)  # [B,HV,V]
++        core = out.to(x.dtype).reshape(-1, self.head_v_dim)
++        core = self.norm(core, z.reshape(-1, self.head_v_dim))
++        core = core.reshape(B, -1)
++        output, _ = self.out_proj(core)
++        return output.view(orig_shape), new_conv.to(conv_state.dtype), h.to(ssm_state.dtype)
++
++
++class HpuQwen4ExpDecoderLayer(nn.Module):
++
++    def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        self.config = config
++        self.layer_type = layer_type
++        self.layer_idx = extract_layer_index(prefix)
++        self.hc_count = int(config.hc_count)
++
++        self.ple: HpuQwen4ExpPLELayer | None = None
++        ple_layer_ids = sorted(set(int(i) for i in (config.ple_layer_ids or [])))
++        if (self.layer_idx + 1) in ple_layer_ids:
++            dense_id = ple_layer_ids.index(self.layer_idx + 1)
++            self.ple = HpuQwen4ExpPLELayer(config, vllm_config=vllm_config, layer_idx=self.layer_idx,
++                                           ple_dense_layer_id=dense_id, prefix=f"{prefix}.ple")
++
++        import contextlib
++        with (_tp1_context() if _DENSE_REPLICATED else contextlib.nullcontext()):
++            if layer_type == "linear_attention":
++                self.linear_attn = HpuQwen4ExpGDN(config, vllm_config=vllm_config,
++                                                             prefix=f"{prefix}.linear_attn",
++                                                             gqa_interleaved_layout=False)
++            elif layer_type == "full_attention":
++                self.self_attn = Qwen3NextAttention(config, model_config=model_config, cache_config=cache_config,
++                                                    quant_config=quant_config, prefix=f"{prefix}.self_attn")
++                if getattr(config, "indexer_n_heads", None) is not None:
++                    self.self_attn.indexer = HpuQSAIndexerWeights(config, quant_config,
++                                                                  prefix=f"{prefix}.self_attn.indexer")
++            else:
++                raise ValueError(f"Invalid layer_type {layer_type}")
++
++        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
++        num_experts = getattr(config, "num_experts", 0) or 0
++        sparse_step = getattr(config, "decoder_sparse_step", 1) or 1
++        is_moe = self.layer_idx not in mlp_only_layers and num_experts > 0 and (self.layer_idx + 1) % sparse_step == 0
++        if is_moe:
++            self.mlp = HpuQwen4ExpSparseMoeBlock(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
++        else:
++            self.mlp = Qwen3NextMLP(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
++                                    hidden_act=config.hidden_act, quant_config=quant_config, prefix=f"{prefix}.mlp")
++
++        hc_config = HyperConnectionConfig(hc_count=config.hc_count, hidden_size=config.hidden_size,
++                                          params_dtype=torch.bfloat16, hc_lowrank=config.hc_lowrank,
++                                          rms_norm_eps=config.rms_norm_eps, hc_per_branch_norm=True)
++        self.attn_hyper_connection = GatedResidual(hc_config)
++        self.mlp_hyper_connection = GatedResidual(hc_config)
++
++    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor,
++                input_ids: torch.Tensor | None, state_writes: list | None = None, ple_meta=None,
++                gdn_slots: torch.Tensor | None = None) -> torch.Tensor:
++        ple_writes = None
++        fast = gdn_slots is not None
++        if self.ple is not None and not _ABL["PLE"]:
++            if input_ids is None:
++                raise RuntimeError("PLE layer requires raw input_ids")
++            if state_writes is not None:
++                ple_out, ple_writes = self.ple(hidden_states, input_ids, state_writes, ple_meta, fast=fast)
++            else:
++                ple_out = self.ple(hidden_states, input_ids, None, ple_meta)
++            hidden_states = hidden_states + ple_out
++        if fast and self.layer_type == "linear_attention" and not _ABL["HC"] and not _ABL["GDN"]:
++            # graph-break-free decode: explicit slots, state read in-graph, writes returned to the caller
++            block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
++            kv = self.linear_attn.kv_cache
++            attn_out, new_conv, new_ssm = self.linear_attn.forward_decode(block_input, kv[0], kv[1], gdn_slots)
++            hidden_states = self.attn_hyper_connection.combine(attn_out, residuals)
++            block_input, residuals = self.mlp_hyper_connection.mix(hidden_states)
++            mlp_out = block_input if _ABL["MOE"] else self.mlp(block_input)
++            hidden_states = self.mlp_hyper_connection.combine(mlp_out, residuals)
++            writes = [(kv[0], gdn_slots, new_conv), (kv[1], gdn_slots, new_ssm)]
++            if ple_writes is not None:
++                pl = self.ple.kv_cache
++                writes += [(pl[0], ple_writes[0], ple_writes[1]), (pl[1], ple_writes[0], ple_writes[2])]
++            return hidden_states, writes
++        if ple_writes is not None:
++            pl = self.ple.kv_cache
++            ple_writes = [(pl[0], ple_writes[0], ple_writes[1]), (pl[1], ple_writes[0], ple_writes[2])]
++
++        if _ABL["HC"]:  # plain residual on stream 0 (timing only)
++            x0 = hidden_states[..., :self.config.hidden_size]
++            if self.layer_type == "linear_attention":
++                a = x0 if _ABL["GDN"] else self.linear_attn(hidden_states=x0)
++            else:
++                a = x0 if _ABL["ATTN"] else self.self_attn(positions=positions, hidden_states=x0)
++            x0 = x0 + a
++            m = x0 if _ABL["MOE"] else self.mlp(x0)
++            x0 = x0 + m
++            out = torch.cat([x0] * self.hc_count, dim=-1)
++            return (out, ple_writes) if state_writes is not None else out
++
++        block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
++        if _ABL["GDN"] and self.layer_type == "linear_attention":
++            attn_out = block_input
++        elif _ABL["ATTN"] and self.layer_type == "full_attention":
++            attn_out = block_input
++        elif self.layer_type == "linear_attention":
++            if _DEBUG_DEEP and self.layer_idx in (0, 1, 2):
++                kv = self.linear_attn.kv_cache
++                _dbg(f"gdn{self.layer_idx}.state", kv[0] if len(kv) else None, kv[1] if len(kv) > 1 else None, block_input)
++            attn_out = self.linear_attn(hidden_states=block_input)
++            if _DEBUG_DEEP and self.layer_idx in (0, 1, 2):
++                _dbg(f"gdn{self.layer_idx}.out", attn_out)
++        else:
++            attn_out = self.self_attn(positions=positions, hidden_states=block_input)
++        hidden_states = self.attn_hyper_connection.combine(attn_out, residuals)
++
++        block_input, residuals = self.mlp_hyper_connection.mix(hidden_states)
++        mlp_out = block_input if _ABL["MOE"] else self.mlp(block_input)
++        hidden_states = self.mlp_hyper_connection.combine(mlp_out, residuals)
++        if state_writes is not None:
++            return hidden_states, ple_writes
++        return hidden_states
++
++
++# ---------------------------------------------------------------------------
++# Model
++# ---------------------------------------------------------------------------
++class HpuQwen4ExpMixtureOfExperts(MixtureOfExperts):
++
++    def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
++        self.moe_layers = []
++        self.moe_mlp_layers = []
++        example_moe = None
++        for layer in layers:
++            if isinstance(layer, HpuQwen4ExpDecoderLayer) and isinstance(layer.mlp, HpuQwen4ExpSparseMoeBlock):
++                example_moe = layer.mlp
++                self.moe_mlp_layers.append(layer.mlp)
++                self.moe_layers.append(layer.mlp.experts)
++        self.num_moe_layers = len(self.moe_layers)
++        if example_moe is None:
++            self.num_expert_groups = 0
++            self.num_shared_experts = 0
++            self.num_logical_experts = 0
++            self.num_physical_experts = 0
++            self.num_local_physical_experts = 0
++            self.num_routed_experts = 0
++            self.num_redundant_experts = 0
++            return
++        self.num_expert_groups = 1
++        self.num_shared_experts = example_moe.n_shared_experts
++        self.num_logical_experts = example_moe.n_logical_experts
++        self.num_physical_experts = example_moe.n_physical_experts
++        self.num_local_physical_experts = example_moe.n_local_physical_experts
++        self.num_routed_experts = example_moe.n_routed_experts
++        self.num_redundant_experts = example_moe.n_redundant_experts
++
++    def update_physical_experts_metadata(self, num_physical_experts: int, num_local_physical_experts: int) -> None:
++        assert self.num_local_physical_experts == num_local_physical_experts
++        self.num_physical_experts = num_physical_experts
++        self.num_local_physical_experts = num_local_physical_experts
++        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
++        for moe in self.moe_mlp_layers:
++            moe.n_physical_experts = num_physical_experts
++            moe.n_local_physical_experts = num_local_physical_experts
++            moe.n_redundant_experts = self.num_redundant_experts
++            moe.experts.update_expert_map()
++
++
++class _LayerGroup(nn.Module):
++    """Runs a fixed list of decoder layers; compiled as one region (layers unregistered on purpose)."""
++
++    def __init__(self, layers: list) -> None:
++        super().__init__()
++        self._group_layers = layers
++        # unrolled forward from a real source file (see qwen4_exp_groups.py); marker QWEN4_LOOP_GROUPS restores
++        # the looped variant (bisecting only)
++        if _marker("QWEN4_UNROLLED_GROUPS"):  # opt-in: fused regions are slower unless collectives stay in-graph
++            self.forward = types.MethodType(_GROUP_FORWARDS[len(layers)], self)
++
++    def forward(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++                prev_writes=None):
++        if prev_writes:
++            for (state, idx, val) in prev_writes:
++                state.index_copy_(0, idx, val)
++        writes = []
++        if gdn_slots is None:
++            # default (reference) path: exactly the pre-fast-path structure — the layer is called directly (an extra
++            # `_call_layer` frame per layer cost ~15% at TP4: try56 31.6 vs try57 37.0 tok/s)
++            for layer in self._group_layers:
++                hidden_states, w = layer(hidden_states, positions, input_ids, state_writes, ple_meta)
++                if w:
++                    writes.extend(w)
++            return hidden_states, writes
++        for i in range(len(self._group_layers)):
++            hidden_states, w = self._call_layer(i, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++            if w:
++                writes.extend(w)
++        return hidden_states, writes
++
++    def _call_layer(self, i, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots):
++        layer = self._group_layers[i]
++        if gdn_slots is not None and layer.layer_type == "linear_attention":
++            return layer(hidden_states, positions, input_ids, state_writes, ple_meta,
++                         gdn_slots=gdn_slots[layer._gdn_ordinal])
++        return layer(hidden_states, positions, input_ids, state_writes, ple_meta)
++
++
++class _CommitRegion(nn.Module):
++    """Applies the last region's pending state writes (compiled as its own region)."""
++
++    def forward(self, hidden_states, writes):
++        for (state, idx, val) in writes:
++            state.index_copy_(0, idx, val)
++        return hidden_states
++
++
++class HpuQwen4ExpModel(nn.Module):
++    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        self.config = config
++        self.vocab_size = config.vocab_size
++        self.hc_count = int(config.hc_count)
++        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
++
++        def get_layer(prefix: str) -> HpuQwen4ExpDecoderLayer:
++            layer_idx = extract_layer_index(prefix)
++            return HpuQwen4ExpDecoderLayer(vllm_config, layer_type=config.layer_types[layer_idx], prefix=prefix)
++
++        self.start_layer, self.end_layer, self.layers = make_layers(config.num_hidden_layers, get_layer,
++                                                                    prefix=f"{prefix}.layers")
++        # Group consecutive layers into modules so the runner's regional compilation (one region per
++        # ModuleList child) compiles G layers as a single graph. Groups keep the layer modules in a plain
++        # list (unregistered) so parameter names / weight loading stay on ``self.layers``.
++        G = max(1, _LAYERS_PER_REGION)
++        # The runner's regional compilation must NOT compile the individual layers (they would run as nested
++        # dynamo frames inside the group regions: one cache lookup per layer per step, ~0.2 ms each).
++        # layers stay individually compiled regions (as in try46B) unless the fused/unrolled mode is used
++        self.layers._no_regional_compile = _marker("QWEN4_UNROLLED_GROUPS") and not _marker("QWEN4_LAYERS_COMPILED")
++        real_layers = list(self.layers)[self.start_layer:self.end_layer]
++        self.layer_groups = nn.ModuleList(
++            [_LayerGroup(real_layers[i:i + G]) for i in range(0, len(real_layers), G)])
++        self.commit_region = nn.ModuleList([_CommitRegion()])
++        self._gdn_layers = [l for l in real_layers if l.layer_type == "linear_attention"]
++        for i, l in enumerate(self._gdn_layers):
++            l._gdn_ordinal = i
++        self._gdn_cg = None
++        ple_layers = [l.ple for l in real_layers if getattr(l, "ple", None) is not None]
++        assert len(ple_layers) <= 1, "one PLE layer supported"
++        self._ple_layer = ple_layers[0] if ple_layers else None
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states"], config.hidden_size * config.hc_count)
++        hc_config = HyperConnectionConfig(hc_count=config.hc_count, hidden_size=config.hidden_size,
++                                          params_dtype=torch.bfloat16, hc_lowrank=config.hc_lowrank,
++                                          rms_norm_eps=config.rms_norm_eps, hc_per_branch_norm=True)
++        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
++                intermediate_tensors: IntermediateTensors | None = None,
++                inputs_embeds: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
++        if inputs_embeds is not None:
++            hidden_states = inputs_embeds
++        else:
++            if input_ids is None:
++                raise ValueError("input_ids or inputs_embeds is required")
++            hidden_states = self.embed_input_ids(input_ids)
++        rep = [1] * (hidden_states.dim() - 1) + [self.hc_count]
++        hidden_states = hidden_states.repeat(*rep)
++        # Resolve PLE metadata eagerly (outside any compiled region) so lengths / state slots are graph inputs.
++        ple_meta = None
++        if self._ple_layer is not None and input_ids is not None:
++            ple_meta = self._ple_layer.get_meta(input_ids)
++
++        if _DEBUG:
++            _dbg("embed", hidden_states, input_ids)
++            md = get_forward_context().attn_metadata
++            _dbg("meta", getattr(md, "load_indices_tensor", None) if md is not None else None,
++                 getattr(md, "has_initial_states_p", None) if md is not None else None,
++                 getattr(md, "query_start_loc_p", None) if md is not None else None)
++            for li in (0, 1):
++                lyr = self.layers[li]
++                if getattr(lyr, "ple", None) is not None and len(lyr.ple.kv_cache) == 2:
++                    _dbg(f"state.ple{li}", lyr.ple.kv_cache[0], lyr.ple.kv_cache[1])
++                if hasattr(lyr, "linear_attn") and len(lyr.linear_attn.kv_cache) == 2:
++                    _dbg(f"state.gdn{li}", lyr.linear_attn.kv_cache[0], lyr.linear_attn.kv_cache[1])
++        if _DEBUG and _marker("QWEN4_DEBUG_GROUPS"):
++            # probes per group, keeping the production (grouped) execution path
++            for gi, group in enumerate(self.layer_groups):
++                hidden_states, _w = group(hidden_states, positions, input_ids, True, ple_meta)
++                _dbg_rows(f"group{gi}", hidden_states)
++        elif _DEBUG:
++            for i, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
++                hidden_states = layer(hidden_states, positions, input_ids, None, ple_meta)
++                if i < 4 or i % 8 == 7 or i == self.end_layer - 1:
++                    _dbg(f"layer{i}", hidden_states)
++        elif (gdn_slots := self._decode_fast_slots(input_ids)) is not None:
++            # Graph-break-free decode: explicit metadata, in-graph state reads, writes applied one region later.
++            pending = []
++            for group in self.layer_groups:
++                hidden_states, pending = group(hidden_states, positions, input_ids, True, ple_meta, gdn_slots, pending)
++            hidden_states = self.commit_region[0](hidden_states, pending)
++        else:
++            for group in self.layer_groups:
++                hidden_states, writes = group(hidden_states, positions, input_ids, True, ple_meta)
++                for (state, idx, val) in writes:
++                    state.index_copy_(0, idx, val)  # eager, outside the compiled region
++
++        sample_hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
++        if _DEBUG: _dbg("final", sample_hidden_states)
++        return sample_hidden_states
++
++    def _decode_fast_slots(self, input_ids):
++        """Per-GDN-layer state slots [n_gdn, B] for a single-token decode step, or None (use the plugin path)."""
++        if not _FAST_DECODE or _DEBUG or input_ids is None:
++            return None
++        md = get_forward_context().attn_metadata
++        if md is None or getattr(md, "is_prompt", False):
++            return None
++        li = getattr(md, "load_indices_tensor", None)
++        if li is None or not self._gdn_layers:
++            return None
++        if input_ids.dim() == 2 and input_ids.shape[1] != 1:
++            return None  # multi-token decode (spec decode) not supported by the fast path
++        kv = self._gdn_layers[0].linear_attn.kv_cache
++        if len(kv) < 2 or kv[0].numel() == 0:
++            return None
++        n = len(self._gdn_layers)
++        if li.dim() > 1:
++            if self._gdn_cg is None:
++                cgs = [l.linear_attn.cache_group_idx for l in self._gdn_layers]
++                if any(c is None for c in cgs):
++                    return None
++                self._gdn_cg = torch.stack([c.reshape(1) for c in cgs]).reshape(-1).to(li.device)
++            slots = li.index_select(0, self._gdn_cg)
++        else:
++            slots = li.reshape(1, -1).expand(n, -1)
++        B = input_ids.shape[0] if input_ids.dim() == 2 else input_ids.numel()
++        if slots.shape[1] != B:
++            if not getattr(self, "_fast_warned", False):
++                self._fast_warned = True
++                print(f"[QWEN4] fast decode skipped: slots {tuple(slots.shape)} vs B={B}", file=_sys.stderr, flush=True)
++            return None
++        if not getattr(self, "_fast_announced", False):
++            self._fast_announced = True
++            print(f"[QWEN4] fast decode path active (n_gdn={n}, B={B})", file=_sys.stderr, flush=True)
++        return torch.remainder(slots, kv[1].shape[0]).long()
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        weights = maybe_fuse_shared_experts(weights, enabled=False,
++                                            n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
++                                            n_shared_experts=1, ckpt_prefix="mlp.shared_expert")
++        skip_substrs = ("hashstats_", "token_lookup", "hyper_connection_mixer.block_inject_weight")
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr={s: None for s in skip_substrs})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        return loader.load_weights(weights, mapper=mapper)
++
++
++class HpuQwen4ExpForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsMRoPE, SupportsPP,
++                             HpuQwen4ExpMixtureOfExperts, IsHybrid):
++    packed_modules_mapping = {
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
++        "in_proj_ba": ["in_proj_b", "in_proj_a"],
++    }
++    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
++    requires_raw_input_tokens = True
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        self.vllm_config = vllm_config
++        self.model_config = vllm_config.model_config
++        self.quant_config = vllm_config.quant_config
++        self.config = config
++        configure_markers(getattr(vllm_config.model_config, "model", None))
++        self.model = HpuQwen4ExpModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
++        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
++        self.set_moe_parameters(self.model.layers)
++
++    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
++        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def get_mrope_input_positions(self, input_tokens: list[int],
++                                  mm_features: list[MultiModalFeatureSpec]) -> tuple[torch.Tensor, int]:
++        positions = torch.arange(len(input_tokens), dtype=torch.long)
++        return positions.unsqueeze(0).expand(3, -1), 0
++
++    # --- hybrid cache spec plumbing ------------------------------------------
++    @classmethod
++    def get_ple_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype, ...]:
++        return ple_state_dtypes(vllm_config.model_config.dtype)
++
++    @classmethod
++    def get_ple_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        hf = vllm_config.model_config.hf_text_config
++        conv_state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
++        return ple_state_shapes(conv_state_len, int(hf.hidden_size) * int(hf.hc_count), int(hf.ngram_size) - 1)
++
++    @classmethod
++    def get_gdn_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
++        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(vllm_config.model_config.dtype,
++                                                                     vllm_config.cache_config.mamba_cache_dtype,
++                                                                     vllm_config.cache_config.mamba_ssm_cache_dtype)
++
++    @classmethod
++    def get_gdn_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        hf = vllm_config.model_config.hf_text_config
++        tp_size = 1 if _DENSE_REPLICATED else vllm_config.parallel_config.tensor_parallel_size
++        num_spec = (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
++        return MambaStateShapeCalculator.gated_delta_net_state_shape(tp_size, hf.linear_num_key_heads,
++                                                                     hf.linear_num_value_heads, hf.linear_key_head_dim,
++                                                                     hf.linear_value_head_dim,
++                                                                     hf.linear_conv_kernel_dim, num_spec)
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
++        return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
++        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
++
++    @classmethod
++    def get_mamba_state_copy_funcs(cls, mamba_types: set[MambaAttentionBackendEnum]) -> MambaStateCopyFuncsByType:
++        funcs = {
++            MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func(),
++            MambaAttentionBackendEnum.SHORT_CONV: MambaStateCopyFuncCalculator.short_conv_state_copy_func(),
++        }
++        return {t: funcs[t] for t in mamba_types}
++
++    @classmethod
++    def get_mamba_specs_from_config(cls, vllm_config: VllmConfig) -> tuple[MambaSpec, ...]:
++        return (
++            MambaSpec(shapes=cls.get_gdn_mamba_state_shape_from_config(vllm_config),
++                      dtypes=cls.get_gdn_mamba_state_dtype_from_config(vllm_config), block_size=-1),
++            MambaSpec(shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
++                      dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config), block_size=-1,
++                      tp_replicated=True),
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr={"mtp.": None})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        with _load_ctx():
++            return loader.load_weights(weights, mapper=mapper)
++
++
++class HpuQwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
++
++    def get_hf_config(self) -> Qwen4ExpConfig:
++        return self.ctx.get_hf_config(Qwen4ExpConfig)
++
++
++@MULTIMODAL_REGISTRY.register_processor(Qwen3VLMultiModalProcessor, info=HpuQwen4ExpProcessingInfo,
++                                        dummy_inputs=Qwen3VLDummyInputsBuilder)
++class HpuQwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration, HasInnerState,
++                                          HpuQwen4ExpMixtureOfExperts):
++    """Qwen3-VL vision tower backed by the HPU Qwen4Exp language model."""
++
++    requires_raw_input_tokens = True
++    packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
++        nn.Module.__init__(self)
++        config: Qwen4ExpConfig = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++        if multimodal_config is None:
++            raise ValueError("Qwen4ExpForConditionalGeneration requires multimodal_config")
++        self.config = config
++        self.model_config = vllm_config.model_config
++        self.multimodal_config = multimodal_config
++        self.language_model_only = multimodal_config.language_model_only
++        configure_markers(getattr(vllm_config.model_config, "model", None))
++        if self.language_model_only:
++            self.use_data_parallel = False
++            self.is_multimodal_pruning_enabled = False
++            self.video_pruning_method = None
++            self.video_pruning_rate = 0.0
++            self._tokenizer = None
++            self.visual = StageMissingLayer("vision_tower")
++            self._tower_model_names = []
++        else:
++            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++            self._init_video_pruning(multimodal_config)
++            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
++            with self._mark_tower_model(vllm_config, {"image", "video"}):
++                self.visual = Qwen3_VisionTransformer(config.vision_config, norm_eps=config.text_config.rms_norm_eps,
++                                                      quant_config=quant_config, prefix=maybe_prefix(prefix, "visual"))
++        self.use_deepstack = False
++        self.deepstack_num_level = 0
++        self.visual_dim = config.vision_config.out_hidden_size
++        self.multiscale_dim = 0
++        with self._mark_language_model(vllm_config):
++            self.language_model = HpuQwen4ExpForCausalLM(vllm_config=vllm_config,
++                                                         prefix=maybe_prefix(prefix, "language_model"))
++        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
++        self.set_moe_parameters(self.language_model.model.layers)
++
++    def embed_input_ids(self, input_ids: torch.Tensor, multimodal_embeddings: MultiModalEmbeddings | None = None, *,
++                        is_multimodal: torch.Tensor | None = None) -> torch.Tensor:
++        inputs_embeds = self._embed_text_input_ids(input_ids, self.language_model.embed_input_ids,
++                                                   is_multimodal=is_multimodal)
++        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
++            return inputs_embeds
++        if self.language_model_only:
++            raise ValueError("language_model_only does not accept multimodal embeddings")
++        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
++        from vllm.model_executor.models.interfaces import _require_is_multimodal
++        is_multimodal = _require_is_multimodal(is_multimodal)
++        return _merge_multimodal_embeddings(inputs_embeds=inputs_embeds, multimodal_embeddings=multimodal_embeddings,
++                                            is_multimodal=is_multimodal)
++
++    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
++        if intermediate_tensors is not None:
++            inputs_embeds = None
++        return self.language_model.model(input_ids=input_ids, positions=positions,
++                                         intermediate_tensors=intermediate_tensors, inputs_embeds=inputs_embeds)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(
++            orig_to_new_substr={"mtp.": None},
++            orig_to_new_prefix={"visual.": None} if self.language_model_only else {})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        with _load_ctx():
++            return loader.load_weights(weights, mapper=mapper)
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_shape_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_copy_func(cls):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_copy_func()
++
++    @classmethod
++    def get_mamba_state_copy_funcs(cls, mamba_types):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_copy_funcs(mamba_types)
++
++    @classmethod
++    def get_mamba_specs_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
++
++
++__all__ = ["HpuQwen4ExpForCausalLM", "HpuQwen4ExpForConditionalGeneration", "HpuQwen4ExpPLELayer"]
+diff --git a/vllm_gaudi/models/qwen4_exp_groups.py b/vllm_gaudi/models/qwen4_exp_groups.py
+new file mode 100644
+index 0000000..a82b7ee
+--- /dev/null
++++ b/vllm_gaudi/models/qwen4_exp_groups.py
+@@ -0,0 +1,347 @@
++# Generated unrolled group forwards (one statement per layer): dynamo skips a frame that graph-breaks inside a
++# for-loop, and the HPU backend needs real source files for its stack traces (no exec-generated code).
++# Regenerate with the snippet in docs/04_BUILD_LOG.md entry 48 if the group signature changes.
++
++def forward_1(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_2(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_3(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_4(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_5(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_6(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_7(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_8(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(7, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_9(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(7, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(8, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_10(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(7, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(8, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(9, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_11(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(7, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(8, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(9, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(10, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++def forward_12(self, hidden_states, positions, input_ids, state_writes, ple_meta=None, gdn_slots=None,
++            prev_writes=None):
++    if prev_writes:
++        for (state, idx, val) in prev_writes:
++            state.index_copy_(0, idx, val)
++    writes = []
++    hidden_states, w = self._call_layer(0, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(1, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(2, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(3, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(4, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(5, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(6, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(7, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(8, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(9, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(10, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    hidden_states, w = self._call_layer(11, hidden_states, positions, input_ids, state_writes, ple_meta, gdn_slots)
++    if w:
++        writes.extend(w)
++    return hidden_states, writes
++
++
++FORWARDS = {1: forward_1, 2: forward_2, 3: forward_3, 4: forward_4, 5: forward_5, 6: forward_6, 7: forward_7, 8: forward_8, 9: forward_9, 10: forward_10, 11: forward_11, 12: forward_12}
+diff --git a/vllm_gaudi/models/qwen4_exp_legacy.py b/vllm_gaudi/models/qwen4_exp_legacy.py
+new file mode 100644
+index 0000000..9672196
+--- /dev/null
++++ b/vllm_gaudi/models/qwen4_exp_legacy.py
+@@ -0,0 +1,1116 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU implementation of Qwen4Exp (Qwen3.8-Flash-Next).
++
++Upstream vLLM ships a CUDA/ROCm-only implementation (Triton hyper-connection
++kernels, FlashAttention-based sparse QSA attention, Triton PLE kernels, CUDA
++top-k ops).  This module re-implements the model with pure PyTorch on top of
++the plugin's existing HPU building blocks:
++
++* linear-attention layers  -> ``HPUGatedDeltaNetAttention`` (same layout as Qwen3.5)
++* full-attention layers    -> ``Qwen3NextAttention`` + HPU paged attention.
++                              The Qwen Sparse Attention (QSA) indexer selects
++                              the top ``indexer_budget`` (=2048) tokens; for
++                              contexts up to that budget dense attention is
++                              mathematically identical.  Beyond the budget we
++                              currently run dense attention (documented
++                              approximation, see docs/).
++* hyper-connections        -> upstream pure-torch ``GatedResidual``
++* PLE n-gram layer         -> HPU-native lookup table (uint8 storage + LUT
++                              dequant), int32 bit-exact hashing, dilated
++                              depthwise conv with per-request state kept in
++                              the hybrid Mamba cache (compact GDN slots).
++* MoE                      -> ``Qwen3NextSparseMoeBlock`` (HPU fused MoE, FP8).
++"""
++from collections.abc import Iterable, Sequence
++from itertools import islice
++import math
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
++                              tensor_model_parallel_all_reduce)
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.layers.layernorm import GemmaRMSNorm
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.abstract import MambaBase
++from vllm.model_executor.layers.mamba.mamba_utils import (MambaStateCopyFunc, MambaStateCopyFuncCalculator,
++                                                          MambaStateCopyFuncsByType, MambaStateDtypeCalculator,
++                                                          MambaStateShapeCalculator)
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
++from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts, MultiModalEmbeddings,
++                                                   SupportsLoRA, SupportsMRoPE, SupportsPP)
++from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5Model
++from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextMLP, Qwen3NextSparseMoeBlock
++from vllm.model_executor.models.qwen3_vl import (Qwen3_VisionTransformer, Qwen3VLDummyInputsBuilder,
++                                                 Qwen3VLMultiModalProcessor, Qwen3VLProcessingInfo)
++from vllm.model_executor.models.utils import (AutoWeightsLoader, StageMissingLayer, WeightsMapper,
++                                              extract_layer_index, make_empty_intermediate_tensors_factory,
++                                              make_layers, maybe_fuse_shared_experts, maybe_prefix)
++from vllm.models.qwen4_exp.common.hyperconnection import GatedResidual, HyperConnectionConfig
++from vllm.models.qwen4_exp.config import Qwen4ExpConfig
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import MultiModalFeatureSpec
++from vllm.sequence import IntermediateTensors
++from vllm.tokenizers.registry import cached_tokenizer_from_config
++from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import MambaSpec
++
++from vllm_gaudi.models.qwen3_5 import HPUGatedDeltaNetAttention
++from vllm_gaudi.models.qwen4_exp_ngram_hash import NgramHasher, make_layer_multipliers, make_vocab_layout
++
++logger = init_logger(__name__)
++
++import os as _os
++# Marker files control debug/tuning switches (env vars do not reach HPU workers). A marker is looked up
++# first in the model directory (so side experiments on other checkpoints never affect a real launch), then
++# under /work. ``configure_markers(model_dir)`` is called at model construction; module-level defaults come
++# from /work only.
++_MARKER_DIRS: list = ["/work"]
++
++
++def _marker(name: str) -> bool:
++    return any(_os.path.exists(_os.path.join(d, name)) for d in _MARKER_DIRS)
++
++
++def _marker_int(name: str, default: int) -> int:
++    for d in _MARKER_DIRS:
++        f = _os.path.join(d, name)
++        if _os.path.exists(f):
++            return int(open(f).read().strip())
++    return default
++
++
++def configure_markers(model_dir: str | None) -> None:
++    """Re-resolve all marker-controlled switches for this launch (model dir first, then /work)."""
++    global _MARKER_DIRS, _DEBUG, _DEBUG_DEEP, _PLE_GRAPH_BREAKS, _PLE_EAGER_STATE_WRITE, _LAYERS_PER_REGION
++    global _DENSE_REPLICATED, _ABL
++    if model_dir and _os.path.isdir(model_dir):
++        _MARKER_DIRS = [model_dir] if any(f.startswith("QWEN4_") for f in _os.listdir(model_dir)) else ["/work"]
++    _DEBUG = _marker("QWEN4_DEBUG")
++    _DEBUG_DEEP = _marker("QWEN4_DEBUG_DEEP")
++    _PLE_GRAPH_BREAKS = _marker("QWEN4_PLE_GRAPH_BREAKS")
++    # Deferred writes (state tensors returned from the compiled region and written by the caller) give wrong
++    # results at batch >= 2 on HPU (rows of the second request corrupted); eager in-region writes are the default.
++    _PLE_EAGER_STATE_WRITE = not _marker("QWEN4_PLE_DEFERRED_WRITE")
++    _LAYERS_PER_REGION = _marker_int("QWEN4_LAYERS_PER_REGION", 1)
++    _DENSE_REPLICATED = _marker("QWEN4_DENSE_REPLICATED")
++    _ABL = {k: _marker(f"QWEN4_ABL_NO_{k}") for k in ("MOE", "GDN", "ATTN", "HC", "PLE")}
++    import sys as _sys
++    print(f"[QWEN4] markers from {_MARKER_DIRS}: debug={_DEBUG} deep={_DEBUG_DEEP} ple_breaks={_PLE_GRAPH_BREAKS} "
++          f"eager_write={_PLE_EAGER_STATE_WRITE} layers_per_region={_LAYERS_PER_REGION} dense={_DENSE_REPLICATED} "
++          f"abl={_ABL}", file=_sys.stderr, flush=True)
++
++
++_DEBUG = _os.path.exists("/work/QWEN4_DEBUG")  # file flag: env vars do not reach HPU workers
++_DEBUG_DEEP = _os.path.exists("/work/QWEN4_DEBUG_DEEP")
++# Tunables via marker files (env vars do not reach HPU workers): see docs/05_PERF.md
++_PLE_GRAPH_BREAKS = _os.path.exists("/work/QWEN4_PLE_GRAPH_BREAKS")
++_PLE_EAGER_STATE_WRITE = not _os.path.exists("/work/QWEN4_PLE_DEFERRED_WRITE")
++_LAYERS_PER_REGION = int(open("/work/QWEN4_LAYERS_PER_REGION").read().strip()) if _os.path.exists("/work/QWEN4_LAYERS_PER_REGION") else 1
++# Dense-replicated mode: build every non-expert module with TP=1 semantics (full weights on every rank,
++# no per-layer all-reduce for attention/GDN); only the routed experts stay sharded (EP) with one
++# all-reduce per MoE layer. Costs ~+4.5 GB weights per rank at TP4; removes ~48 collectives per step.
++_DENSE_REPLICATED = _os.path.exists("/work/QWEN4_DENSE_REPLICATED")
++
++
++class _tp1_context:
++    """Temporarily make the TP-size/rank helpers report (1, 0) in the modules that build dense layers."""
++    _targets = ("vllm.model_executor.layers.linear", "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
++                "vllm.model_executor.layers.mamba.gdn.base", "vllm.model_executor.layers.attention.attention",
++                "vllm.model_executor.models.qwen3_next", "vllm.model_executor.layers.mamba.abstract",
++                "vllm.model_executor.layers.layernorm", "vllm_gaudi.models.qwen3_5", "vllm.distributed",
++                "vllm.distributed.parallel_state")
++
++    def __init__(self, targets=None):
++        self._targets_override = targets
++
++    def __enter__(self):
++        import importlib
++        self._saved = []
++        for name in (self._targets_override or self._targets):
++            try:
++                mod = importlib.import_module(name)
++            except Exception:
++                continue
++            for fn, val in (("get_tensor_model_parallel_world_size", 1), ("get_tensor_model_parallel_rank", 0)):
++                if hasattr(mod, fn):
++                    self._saved.append((mod, fn, getattr(mod, fn)))
++                    setattr(mod, fn, (lambda v=val: v))
++        return self
++
++    def __exit__(self, *a):
++        for mod, fn, orig in self._saved:
++            setattr(mod, fn, orig)
++        return False
++
++
++def _load_ctx():
++    """During weight loading, sharded_weight_loader (GDN A_log/dt_bias/conv) reads the TP rank at call time."""
++    import contextlib
++    if not _DENSE_REPLICATED:
++        return contextlib.nullcontext()
++    return _tp1_context(targets=("vllm.model_executor.model_loader.weight_utils",
++                                 "vllm.model_executor.layers.mamba.mamba_mixer2"))
++
++
++# Ablation switches for timing experiments only (outputs are garbage when set)
++_ABL = {k: _os.path.exists(f"/work/QWEN4_ABL_NO_{k}") for k in ("MOE", "GDN", "ATTN", "HC", "PLE")}
++if any(_ABL.values()):
++    import sys as _sys
++    print(f"[QWEN4] ABLATION active: {_ABL}", file=_sys.stderr, flush=True)
++if _DEBUG:
++    import sys as _sys
++    print(f"[QWEN4_DEBUG] probes enabled at import (pid {_os.getpid()})", file=_sys.stderr, flush=True)
++if not _os.path.exists("/work/QWEN4_NO_FAST_TOPK"):
++    from vllm_gaudi.ops.hpu_topk_topp import install as _install_fast_topk
++    _install_fast_topk()
++if _os.path.exists("/work/QWEN4_DEBUG_GB"):
++    torch._logging.set_logs(graph_breaks=True, recompiles=True)
++
++
++@torch._dynamo.disable
++def _dbg(tag: str, *tensors) -> None:
++    """NaN/absmax probe (QWEN4_DEBUG=1), rank 0 only, eager."""
++    if not _DEBUG:
++        return
++    try:
++        if get_tensor_model_parallel_rank() != 0:
++            return
++    except Exception:
++        pass
++    parts = []
++    for t in tensors:
++        if t is None or not isinstance(t, torch.Tensor) or t.numel() == 0:
++            parts.append("None")
++            continue
++        tf = t.detach()
++        if tf.is_floating_point():
++            parts.append(f"nan={int(torch.isnan(tf).sum())} inf={int(torch.isinf(tf).sum())} absmax={float(tf.abs().max()):.3g} shape={tuple(tf.shape)}")
++        else:
++            parts.append(f"min={int(tf.min())} max={int(tf.max())} shape={tuple(tf.shape)} vals={tf.flatten()[:8].tolist()}")
++    import sys as _sys
++    print("[QWEN4_DEBUG] " + tag + ": " + " | ".join(parts), file=_sys.stderr, flush=True)
++
++_IGNORED_SUFFIXES = [".bias", "_bias", ".k_scale", "_k_scale", ".v_scale", "_v_scale", "_weight_scale", "_input_scale"]
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++class GroupedNorm(nn.Module):
++    """Gemma-style RMSNorm applied independently to each ``group_size`` chunk."""
++
++    def __init__(self, hidden_size: int, eps: float, group_size: int, dtype: torch.dtype) -> None:
++        super().__init__()
++        assert hidden_size % group_size == 0
++        self.eps = eps
++        self.group_size = group_size
++        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        in_dtype = x.dtype
++        xf = x.float()
++        g = xf.unflatten(-1, (xf.shape[-1] // self.group_size, self.group_size))
++        var = g.square().mean(dim=-1, keepdim=True)
++        normed = (g * torch.rsqrt(var + self.eps)).flatten(-2)
++        return (normed * (1.0 + self.weight.float())).to(in_dtype)
++
++
++@torch._dynamo.disable
++def _save_state(passthrough: torch.Tensor, state: torch.Tensor, indices: torch.Tensor,
++                values: torch.Tensor) -> torch.Tensor:
++    """index_copy_ outside of torch.compile (HPU compile drops aliased in-place index_copy_)."""
++    state.index_copy_(0, indices, values.to(dtype=state.dtype))
++    return passthrough
++
++
++@torch._dynamo.disable
++def _save_state_prefill(passthrough: torch.Tensor, conv_state: torch.Tensor, tok_state: torch.Tensor,
++                        state_indices: torch.Tensor, hist: torch.Tensor, tokseq: torch.Tensor, qsl: torch.Tensor,
++                        B: int, conv_state_len: int, ctx_len: int) -> torch.Tensor:
++    """Prefill state write done EAGERLY (gather index + index_copy_).
++
++    Inside the compiled region the per-request length gather silently used the state-slot index instead of
++    ``qsl`` for every prefill after the first traced one (verified with probes on the real and the tiny
++    model; a standalone replica compiles correctly). All index math is therefore done here, outside compile,
++    from the eagerly resolved metadata.
++    """
++    num_slots = conv_state.shape[0]
++    safe_idx = torch.remainder(state_indices, num_slots).long()
++    valid = state_indices >= 0
++    qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    dev = hist.device
++    offs = torch.arange(conv_state_len, device=dev, dtype=torch.long)
++    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
++    new_conv = torch.gather(hist, 1, gather_idx)
++    toffs = torch.arange(ctx_len, device=dev, dtype=torch.long)
++    new_tok = torch.gather(tokseq, 1, qlens.view(B, 1) + toffs.view(1, -1))
++    upd = valid & (qlens > 0)
++    new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
++    new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
++    if _DEBUG_DEEP: _dbg("ple.write", qsl, safe_idx, upd.to(torch.int32), new_tok, new_conv)
++    conv_state.index_copy_(0, safe_idx, new_conv)
++    tok_state.index_copy_(0, safe_idx, new_tok)
++    if _DEBUG_DEEP: _dbg("ple.readback", tok_state.index_select(0, safe_idx), conv_state.index_select(0, safe_idx))
++    return passthrough
++
++
++@torch._dynamo.disable
++def _dbg_rows(tag: str, t: torch.Tensor) -> None:
++    """Per-row (dim 0) nan count / absmax, rank 0 only."""
++    if not _DEBUG:
++        return
++    try:
++        if get_tensor_model_parallel_rank() != 0:
++            return
++    except Exception:
++        pass
++    import sys as _sys
++    tf = t.detach().float()
++    rows = []
++    for r in range(min(tf.shape[0], 4)):
++        x = tf[r]
++        rows.append(f"r{r}: nan={int(torch.isnan(x).sum())} absmax={float(x.abs().max()):.3g} mean={float(x.mean()):.3g}")
++    print(f"[QWEN4_DEBUG] {tag} shape={tuple(t.shape)} " + " | ".join(rows), file=_sys.stderr, flush=True)
++
++
++# ---------------------------------------------------------------------------
++# PLE (n-gram) layer
++# ---------------------------------------------------------------------------
++class HpuNgramTable(nn.Module):
++    """TP-sharded FP8 n-gram embedding table stored as raw uint8 with LUT dequant.
++
++    Gaudi2 interprets ``float8_e4m3fn`` bit patterns differently from CPU
++    (e4m3 *fnuz*), so instead of casting we keep the checkpoint bytes and
++    dequantize through a 256-entry lookup table computed on CPU.
++    """
++
++    def __init__(self, padded_vocab_size: int, head_dim: int, split_ngram_parts: int, org_vocab_size: int) -> None:
++        super().__init__()
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.tp_rank = get_tensor_model_parallel_rank()
++        self.padded_vocab_size = padded_vocab_size
++        self.org_vocab_size = org_vocab_size
++        self.head_dim = head_dim
++        self.split_ngram_parts = split_ngram_parts
++        assert padded_vocab_size % self.tp_size == 0
++        self.rows_per_rank = padded_vocab_size // self.tp_size
++        self.vocab_start = self.tp_rank * self.rows_per_rank
++        self.vocab_end = self.vocab_start + self.rows_per_rank
++        self.weight = nn.Parameter(torch.zeros(self.rows_per_rank, head_dim, dtype=torch.uint8), requires_grad=False)
++        self.weight_scale = nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
++        # Build on CPU (torch semantics: 0x7F/0xFF = NaN -> 0). Built on HPU, those codes decode to +-inf.
++        lut = torch.arange(256, dtype=torch.uint8, device="cpu").view(torch.float8_e4m3fn).to(torch.float32)
++        lut = torch.nan_to_num(lut, nan=0.0, posinf=0.0, neginf=0.0)
++        self.register_buffer("lut", lut.to(torch.bfloat16), persistent=False)
++        self._loaded_rows = 0
++
++    def load_shard(self, shard_index: int, loaded_weight: torch.Tensor) -> None:
++        shard_size = (self.org_vocab_size + self.split_ngram_parts - 1) // self.split_ngram_parts
++        ckpt_start = shard_index * shard_size
++        ckpt_end = ckpt_start + loaded_weight.shape[0]
++        lo = max(ckpt_start, self.vocab_start)
++        hi = min(ckpt_end, self.vocab_end)
++        if lo >= hi:
++            return
++        src = loaded_weight[lo - ckpt_start:hi - ckpt_start]
++        if src.dtype != torch.uint8:
++            src = src.view(torch.uint8)
++        with torch.no_grad():
++            self.weight.data[lo - self.vocab_start:hi - self.vocab_start].copy_(src)
++        self._loaded_rows += hi - lo
++
++    def forward(self, ids: torch.Tensor) -> torch.Tensor:
++        """ids int32 [..., H] (global rows) -> bf16 [..., H*head_dim]"""
++        if self.tp_size > 1:
++            mask = (ids >= self.vocab_start) & (ids < self.vocab_end)
++            local = torch.where(mask, ids - self.vocab_start, torch.zeros_like(ids))
++        else:
++            mask = None
++            local = ids
++        flat = local.reshape(-1).long().clamp_(0, self.rows_per_rank - 1)
++        rows = self.weight.index_select(0, flat)  # [N, D] uint8
++        vals = self.lut.index_select(0, rows.reshape(-1).long().clamp_(0, 255)).reshape(rows.shape)  # bf16
++        vals = vals.reshape(*ids.shape, self.head_dim)
++        if mask is not None:
++            vals = vals * mask.unsqueeze(-1).to(vals.dtype)
++        vals = vals.flatten(-2)
++        if self.tp_size > 1:
++            vals = tensor_model_parallel_all_reduce(vals)
++        return vals * self.weight_scale.to(vals.dtype)
++
++
++class HpuQwen4ExpPLELayer(nn.Module, MambaBase):
++    """Position-Learning-Enhancement layer with n-gram embeddings and a dilated short conv.
++
++    Per-request state (kept in the hybrid Mamba cache, one compact slot per request):
++      * conv_state  [conv_state_len, hc_count*hidden]   (bf16)  previous ``normalized`` rows
++      * token_state [ngram_size-1]                       (int32) previous token ids (EOS-initialised)
++    """
++
++    def __init__(self, config: Qwen4ExpTextConfig, vllm_config: VllmConfig, layer_idx: int, ple_dense_layer_id: int,
++                 prefix: str) -> None:
++        super().__init__()
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        self.model_config = model_config
++        self.cache_config = cache_config
++        self.prefix = prefix
++        self.layer_idx = layer_idx
++        self.hidden_size = int(config.hidden_size)
++        self.hc_count = int(config.hc_count)
++        self.hc_hidden_size = self.hidden_size * self.hc_count
++        self.conv_kernel_size = int(config.ple_conv_kernel_size)
++        self.dilation = int(config.ngram_size)
++        self.conv_state_len = (self.conv_kernel_size - 1) * self.dilation
++        self.ngram_size = int(config.ngram_size)
++        self.heads_per_ngram = int(config.heads_per_ngram)
++        self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
++        self.ctx_len = self.ngram_size - 1
++        self.embed_dim = int(config.ple_embed_dim)
++        self.head_dim = self.embed_dim // self.ngram_heads
++        self.eos_token_id = int(config.eos_token_id)
++        self.dtype = model_config.dtype
++        self.cache_group_idx = None  # set by the HPU model runner
++
++        multipliers = make_layer_multipliers(ngram_size=self.ngram_size,
++                                             unigram_vocab_size=int(config.vocab_size),
++                                             seed=int(getattr(config, "seed", 1234)),
++                                             ple_dense_layer_id=ple_dense_layer_id)
++        sizes, offsets, total = make_vocab_layout(ngram_vocab_size_base=int(config.ngram_vocab_size_base),
++                                                  ngram_heads=self.ngram_heads,
++                                                  ple_dense_layer_id=ple_dense_layer_id)
++        # int64 values > 2**31 cannot live on HPU (lazy-mode init runs on device): keep as a Python list.
++        self._expected_multipliers = list(multipliers)
++        divisor = int(config.make_ngram_vocab_size_divisible_by)
++        padded_vocab = ((total + divisor - 1) // divisor) * divisor
++        self.hasher = NgramHasher(multipliers, sizes, offsets, self.heads_per_ngram, self.ngram_size)
++        self.ngram_table = HpuNgramTable(padded_vocab, self.head_dim, int(getattr(config, "split_ngram_parts", 512)),
++                                         total)
++
++        self.key_proj = ReplicatedLinear(self.embed_dim, self.hc_hidden_size, bias=False, quant_config=quant_config,
++                                         prefix=f"{prefix}.key_proj", return_bias=False)
++        self.value_proj = ReplicatedLinear(self.embed_dim, self.hidden_size, bias=False, quant_config=quant_config,
++                                           prefix=f"{prefix}.value_proj", return_bias=False)
++        self.norm_key = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.norm_query = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.norm_conv = GroupedNorm(self.hc_hidden_size, config.rms_norm_eps, self.hidden_size, self.dtype)
++        self.conv1d = nn.Conv1d(self.hc_hidden_size, self.hc_hidden_size, self.conv_kernel_size,
++                                groups=self.hc_hidden_size, bias=False, dtype=self.dtype)
++        nn.init.zeros_(self.conv1d.weight)
++        self.conv1d.weight._no_reinit = True
++        self.kv_cache = (torch.tensor([]), torch.tensor([]))
++        compilation_config = get_current_vllm_config().compilation_config
++        if prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        compilation_config.static_forward_context[prefix] = self
++
++    # --- MambaBase interface -------------------------------------------------
++    @property
++    def mamba_type(self) -> MambaAttentionBackendEnum:
++        return MambaAttentionBackendEnum.SHORT_CONV
++
++    @property
++    def is_kv_cache_tp_replicated(self) -> bool:
++        return True
++
++    def get_attn_backend(self):
++        from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionBackend
++        return ShortConvAttentionBackend
++
++    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
++        return ple_state_dtypes(self.model_config.dtype)
++
++    def get_state_shape(self) -> Sequence[tuple[int, ...]]:
++        return ple_state_shapes(self.conv_state_len, self.hc_hidden_size, self.ctx_len)
++
++    # --- forward ---------------------------------------------------------------
++    def _state_indices(self, attn_metadata):
++        indices = attn_metadata.load_indices_tensor
++        if indices is not None and indices.dim() > 1:
++            cg = self.cache_group_idx
++            assert cg is not None, "cache_group_idx not set for PLE layer"
++            indices = indices.index_select(0, cg.view(1)).squeeze(0)
++        return indices
++
++    def _extract_metadata(self, input_ids: torch.Tensor, num_tokens: int):
++        """Extraction of forward-context metadata into plain tensors / ints (natural dynamo graph break)."""
++        attn_metadata = get_forward_context().attn_metadata
++        conv_state, tok_state = self.kv_cache[0], self.kv_cache[1]
++        have_state = attn_metadata is not None and conv_state.numel() > 0
++        is_prompt = bool(getattr(attn_metadata, "is_prompt", False)) if attn_metadata is not None else False
++        state_indices = self._state_indices(attn_metadata) if have_state else None
++        qsl = attn_metadata.query_start_loc_p if (have_state and is_prompt) else None
++        his = attn_metadata.has_initial_states_p if (have_state and is_prompt) else None
++        pm = getattr(attn_metadata, "padding_mask_flat", None) if (have_state and is_prompt) else None
++        if input_ids.dim() == 2:
++            B, L = int(input_ids.shape[0]), int(input_ids.shape[1])
++        else:
++            if qsl is not None:
++                B = int(qsl.numel()) - 1
++            elif state_indices is not None:
++                B = int(state_indices.numel())
++            else:
++                B = num_tokens
++            L = num_tokens // max(B, 1)
++        return (have_state, is_prompt, state_indices, conv_state, tok_state, qsl, his, pm, B, L)
++
++    def _conv_out(self, hist: torch.Tensor, length: int) -> torch.Tensor:
++        """hist [B, conv_state_len + length, C] -> silu(dilated depthwise conv) [B, length, C]"""
++        w = self.conv1d.weight.view(self.hc_hidden_size, self.conv_kernel_size).to(hist.dtype)
++        out = None
++        for k in range(self.conv_kernel_size):
++            term = hist[:, k * self.dilation:k * self.dilation + length, :] * w[:, k]
++            out = term if out is None else out + term
++        return F.silu(out)
++
++    def get_meta(self, input_ids: torch.Tensor):
++        """Resolve forward-context metadata for this layer EAGERLY (call outside compiled regions).
++
++        Tensors read from the global forward context inside a compiled region were baked as constants by
++        HPU torch.compile (per-request lengths / state slots of the first traced request were reused for
++        later requests → state written from padding). Passing them as explicit inputs avoids that.
++        """
++        return self._extract_metadata(input_ids, int(input_ids.numel()))
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, state_writes: list | None = None,
++                meta=None) -> torch.Tensor:
++        orig_shape = hidden_states.shape
++        C = self.hc_hidden_size
++        h2 = hidden_states.reshape(-1, C)
++        num_tokens = h2.shape[0]
++        device = h2.device
++
++        if meta is None:
++            meta = self._extract_metadata(input_ids, num_tokens)
++        (have_state, is_prompt, state_indices, conv_state, tok_state, qsl, his, pm, B, L) = meta
++
++        tokens = input_ids.reshape(B, L).to(torch.int32)
++        eos = self.eos_token_id
++        pending = None
++
++        if have_state:
++            num_slots = conv_state.shape[0]
++            safe_idx = torch.remainder(state_indices, num_slots).long()
++            valid = (state_indices >= 0)
++            init_conv = conv_state.index_select(0, safe_idx)  # [B, S, C]
++            init_tok = tok_state.index_select(0, safe_idx)  # [B, 2]
++            if is_prompt:
++                if his is None:
++                    use_init = valid
++                else:
++                    if his.numel() < B:
++                        his = F.pad(his, (0, B - his.numel()), value=0)
++                    use_init = his[:B].bool() & valid
++            else:
++                use_init = valid
++            # NaN-safe masking (a stale NaN/Inf slot must not leak into a fresh request)
++            init_conv = torch.where(use_init.view(B, 1, 1), init_conv, torch.zeros_like(init_conv))
++            init_tok = torch.where(use_init.view(B, 1), init_tok, torch.full_like(init_tok, eos))
++        else:
++            init_conv = torch.zeros(B, self.conv_state_len, C, dtype=h2.dtype, device=device)
++            init_tok = torch.full((B, self.ctx_len), eos, dtype=torch.int32, device=device)
++
++        # ---- n-gram ids ---------------------------------------------------------
++        tokseq = torch.cat([init_tok, tokens], dim=1)  # [B, ctx+L]
++        t0 = tokseq[:, self.ctx_len:self.ctx_len + L]
++        t1 = tokseq[:, self.ctx_len - 1:self.ctx_len - 1 + L]
++        t2 = tokseq[:, self.ctx_len - 2:self.ctx_len - 2 + L]
++        eos_t = torch.full_like(t2, eos)
++        t2 = torch.where(t1 == eos, eos_t, t2)
++        t0 = torch.clamp(t0, min=0)  # padded rows may carry -1
++        ids = self.hasher(t0, t1, t2)  # [B, L, H] int32
++        emb = self.ngram_table(ids).reshape(num_tokens, self.embed_dim).to(h2.dtype)
++        if _DEBUG_DEEP: _dbg("ple.in", h2, state_indices, init_tok, init_conv, t0, t1, t2, ids, emb)
++        if _PLE_GRAPH_BREAKS:
++            # Deliberate graph break (partition proven correct when the un-broken region miscompiled).
++            torch._dynamo.graph_break()
++
++        # ---- gate / value ---------------------------------------------------------
++        key = self.key_proj(emb)
++        value = self.value_proj(emb)
++        key = self.norm_key(key).reshape(num_tokens, self.hc_count, self.hidden_size)
++        query = self.norm_query(h2).reshape(num_tokens, self.hc_count, self.hidden_size)
++        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
++        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
++        gated_value = gate * value.unsqueeze(-2)  # [T, hc, H]
++        normalized = self.norm_conv(gated_value.flatten(-2))  # [T, C]
++
++        # ---- dilated short conv with state --------------------------------------
++        x = normalized.reshape(B, L, C)
++        hist = torch.cat([init_conv.to(x.dtype), x], dim=1)  # [B, S+L, C]
++        conv_out = self._conv_out(hist, L)  # [B, L, C]
++
++        if have_state and is_prompt:
++            if pm is not None and pm.numel() == num_tokens:
++                conv_out = conv_out * pm.view(B, L, 1).to(conv_out.dtype)
++            # Always eager: the in-graph length gather used the wrong index (see _save_state_prefill).
++            conv_out = _save_state_prefill(conv_out, conv_state, tok_state, state_indices, hist, tokseq, qsl,
++                                           B, self.conv_state_len, self.ctx_len)
++        elif have_state:
++            new_conv = hist[:, L:L + self.conv_state_len, :]
++            new_tok = tokseq[:, L:L + self.ctx_len]
++            upd = valid
++            new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
++            new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
++            if _PLE_EAGER_STATE_WRITE or state_writes is None:
++                conv_out = _save_state(conv_out, conv_state, safe_idx, new_conv)
++                conv_out = _save_state(conv_out, tok_state, safe_idx, new_tok)
++                if _DEBUG_DEEP: _dbg("ple.readback", tok_state.index_select(0, safe_idx), conv_state.index_select(0, safe_idx))
++            else:
++                # Deferred: the caller applies these index_copy_ writes after the compiled region
++                # returns (in-graph index_put is silently mis-ordered/dropped by HPU torch.compile,
++                # and an eager write inside the region costs a graph break). The tensors are returned
++                # explicitly as graph outputs (list mutation inside the region is not relied upon).
++                pending = (safe_idx, new_conv.to(conv_state.dtype), new_tok.to(tok_state.dtype))
++
++        out = gated_value.flatten(-2) + conv_out.reshape(num_tokens, C)
++        if _DEBUG_DEEP: _dbg("ple.out", gate, gated_value, normalized, conv_out, out)
++        if _PLE_GRAPH_BREAKS:
++            torch._dynamo.graph_break()
++        if state_writes is not None:
++            return out.reshape(orig_shape), pending
++        return out.reshape(orig_shape)
++
++    # --- weights ---------------------------------------------------------------
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loaded: set[str] = set()
++        regular: list[tuple[str, torch.Tensor]] = []
++        shard_prefix = "ple_embedding.ngram_embedding.shard_"
++        for name, w in weights:
++            leaf = name.rsplit(".", 1)[-1]
++            if leaf.startswith("hashstats_") or leaf == "token_lookup":
++                continue
++            if name == "ple_embedding.layer_multipliers":
++                got = w.to(torch.long).tolist()
++                if got != self._expected_multipliers:
++                    raise ValueError(f"PLE multipliers mismatch: ckpt {got} vs computed {self._expected_multipliers}")
++                loaded.add("layer_multipliers")
++                continue
++            if name in ("ple_embedding.ngram_heads_vocab_sizes", "ple_embedding.ngram_heads_offsets"):
++                continue
++            if name == "ple_embedding.ngram_embedding.weight_scale":
++                with torch.no_grad():
++                    self.ngram_table.weight_scale.data.copy_(w.reshape(1).to(torch.bfloat16))
++                loaded.add("ngram_table.weight_scale")
++                continue
++            if name.startswith(shard_prefix) and name.endswith(".weight"):
++                idx_text = name[len(shard_prefix):-len(".weight")]
++                if idx_text.isdigit():
++                    self.ngram_table.load_shard(int(idx_text), w)
++                    loaded.add("ngram_table.weight")
++                    continue
++            regular.append((name, w))
++        if regular:
++            loaded.update(AutoWeightsLoader(self).load_weights(regular))
++        return loaded
++
++
++def ple_state_dtypes(model_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
++    return (model_dtype, torch.int32)
++
++
++def ple_state_shapes(conv_state_len: int, hc_hidden: int, ctx_len: int) -> tuple[tuple[int, ...], ...]:
++    return ((conv_state_len, hc_hidden), (ctx_len, ))
++
++
++# ---------------------------------------------------------------------------
++# Attention (dense fallback for QSA) with indexer weights kept loadable
++# ---------------------------------------------------------------------------
++class HpuQSAIndexerWeights(nn.Module):
++    """Holds the QSA indexer parameters so the checkpoint loads cleanly.
++
++    The sparse top-k selection itself is not executed on HPU (dense attention
++    is used); keeping the weights allows a future sparse implementation.
++    """
++
++    def __init__(self, config: Qwen4ExpTextConfig, quant_config, prefix: str) -> None:
++        super().__init__()
++        n_heads = int(config.indexer_n_heads)
++        kv_heads = int(config.indexer_kv_heads)
++        head_dim = int(config.indexer_head_dim)
++        self.index_qk_proj = ReplicatedLinear(int(config.hidden_size), (n_heads + kv_heads) * head_dim, bias=False,
++                                              quant_config=quant_config, prefix=f"{prefix}.index_qk_proj")
++        self.q_layernorm = GemmaRMSNorm(head_dim, eps=float(config.rms_norm_eps))
++        self.k_layernorm = GemmaRMSNorm(head_dim, eps=float(config.rms_norm_eps))
++
++
++# ---------------------------------------------------------------------------
++# Decoder layer
++# ---------------------------------------------------------------------------
++class HpuQwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
++
++    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        config = vllm_config.model_config.hf_text_config
++        self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
++
++
++class HpuQwen4ExpDecoderLayer(nn.Module):
++
++    def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        self.config = config
++        self.layer_type = layer_type
++        self.layer_idx = extract_layer_index(prefix)
++        self.hc_count = int(config.hc_count)
++
++        self.ple: HpuQwen4ExpPLELayer | None = None
++        ple_layer_ids = sorted(set(int(i) for i in (config.ple_layer_ids or [])))
++        if (self.layer_idx + 1) in ple_layer_ids:
++            dense_id = ple_layer_ids.index(self.layer_idx + 1)
++            self.ple = HpuQwen4ExpPLELayer(config, vllm_config=vllm_config, layer_idx=self.layer_idx,
++                                           ple_dense_layer_id=dense_id, prefix=f"{prefix}.ple")
++
++        import contextlib
++        with (_tp1_context() if _DENSE_REPLICATED else contextlib.nullcontext()):
++            if layer_type == "linear_attention":
++                self.linear_attn = HPUGatedDeltaNetAttention(config, vllm_config=vllm_config,
++                                                             prefix=f"{prefix}.linear_attn",
++                                                             gqa_interleaved_layout=False)
++            elif layer_type == "full_attention":
++                self.self_attn = Qwen3NextAttention(config, model_config=model_config, cache_config=cache_config,
++                                                    quant_config=quant_config, prefix=f"{prefix}.self_attn")
++                if getattr(config, "indexer_n_heads", None) is not None:
++                    self.self_attn.indexer = HpuQSAIndexerWeights(config, quant_config,
++                                                                  prefix=f"{prefix}.self_attn.indexer")
++            else:
++                raise ValueError(f"Invalid layer_type {layer_type}")
++
++        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
++        num_experts = getattr(config, "num_experts", 0) or 0
++        sparse_step = getattr(config, "decoder_sparse_step", 1) or 1
++        is_moe = self.layer_idx not in mlp_only_layers and num_experts > 0 and (self.layer_idx + 1) % sparse_step == 0
++        if is_moe:
++            self.mlp = HpuQwen4ExpSparseMoeBlock(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
++        else:
++            self.mlp = Qwen3NextMLP(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
++                                    hidden_act=config.hidden_act, quant_config=quant_config, prefix=f"{prefix}.mlp")
++
++        hc_config = HyperConnectionConfig(hc_count=config.hc_count, hidden_size=config.hidden_size,
++                                          params_dtype=torch.bfloat16, hc_lowrank=config.hc_lowrank,
++                                          rms_norm_eps=config.rms_norm_eps, hc_per_branch_norm=True)
++        self.attn_hyper_connection = GatedResidual(hc_config)
++        self.mlp_hyper_connection = GatedResidual(hc_config)
++
++    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor,
++                input_ids: torch.Tensor | None, state_writes: list | None = None, ple_meta=None) -> torch.Tensor:
++        ple_writes = None
++        if self.ple is not None and not _ABL["PLE"]:
++            if input_ids is None:
++                raise RuntimeError("PLE layer requires raw input_ids")
++            if state_writes is not None:
++                ple_out, ple_writes = self.ple(hidden_states, input_ids, state_writes, ple_meta)
++            else:
++                ple_out = self.ple(hidden_states, input_ids, None, ple_meta)
++            hidden_states = hidden_states + ple_out
++
++        if _ABL["HC"]:  # plain residual on stream 0 (timing only)
++            x0 = hidden_states[..., :self.config.hidden_size]
++            if self.layer_type == "linear_attention":
++                a = x0 if _ABL["GDN"] else self.linear_attn(hidden_states=x0)
++            else:
++                a = x0 if _ABL["ATTN"] else self.self_attn(positions=positions, hidden_states=x0)
++            x0 = x0 + a
++            m = x0 if _ABL["MOE"] else self.mlp(x0)
++            x0 = x0 + m
++            out = torch.cat([x0] * self.hc_count, dim=-1)
++            return (out, ple_writes) if state_writes is not None else out
++
++        block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
++        if _ABL["GDN"] and self.layer_type == "linear_attention":
++            attn_out = block_input
++        elif _ABL["ATTN"] and self.layer_type == "full_attention":
++            attn_out = block_input
++        elif self.layer_type == "linear_attention":
++            if _DEBUG_DEEP and self.layer_idx in (0, 1, 2):
++                kv = self.linear_attn.kv_cache
++                _dbg(f"gdn{self.layer_idx}.state", kv[0] if len(kv) else None, kv[1] if len(kv) > 1 else None, block_input)
++            attn_out = self.linear_attn(hidden_states=block_input)
++            if _DEBUG_DEEP and self.layer_idx in (0, 1, 2):
++                _dbg(f"gdn{self.layer_idx}.out", attn_out)
++        else:
++            attn_out = self.self_attn(positions=positions, hidden_states=block_input)
++        hidden_states = self.attn_hyper_connection.combine(attn_out, residuals)
++
++        block_input, residuals = self.mlp_hyper_connection.mix(hidden_states)
++        mlp_out = block_input if _ABL["MOE"] else self.mlp(block_input)
++        hidden_states = self.mlp_hyper_connection.combine(mlp_out, residuals)
++        if state_writes is not None:
++            return hidden_states, ple_writes
++        return hidden_states
++
++
++# ---------------------------------------------------------------------------
++# Model
++# ---------------------------------------------------------------------------
++class HpuQwen4ExpMixtureOfExperts(MixtureOfExperts):
++
++    def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
++        self.moe_layers = []
++        self.moe_mlp_layers = []
++        example_moe = None
++        for layer in layers:
++            if isinstance(layer, HpuQwen4ExpDecoderLayer) and isinstance(layer.mlp, HpuQwen4ExpSparseMoeBlock):
++                example_moe = layer.mlp
++                self.moe_mlp_layers.append(layer.mlp)
++                self.moe_layers.append(layer.mlp.experts)
++        self.num_moe_layers = len(self.moe_layers)
++        if example_moe is None:
++            self.num_expert_groups = 0
++            self.num_shared_experts = 0
++            self.num_logical_experts = 0
++            self.num_physical_experts = 0
++            self.num_local_physical_experts = 0
++            self.num_routed_experts = 0
++            self.num_redundant_experts = 0
++            return
++        self.num_expert_groups = 1
++        self.num_shared_experts = example_moe.n_shared_experts
++        self.num_logical_experts = example_moe.n_logical_experts
++        self.num_physical_experts = example_moe.n_physical_experts
++        self.num_local_physical_experts = example_moe.n_local_physical_experts
++        self.num_routed_experts = example_moe.n_routed_experts
++        self.num_redundant_experts = example_moe.n_redundant_experts
++
++    def update_physical_experts_metadata(self, num_physical_experts: int, num_local_physical_experts: int) -> None:
++        assert self.num_local_physical_experts == num_local_physical_experts
++        self.num_physical_experts = num_physical_experts
++        self.num_local_physical_experts = num_local_physical_experts
++        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
++        for moe in self.moe_mlp_layers:
++            moe.n_physical_experts = num_physical_experts
++            moe.n_local_physical_experts = num_local_physical_experts
++            moe.n_redundant_experts = self.num_redundant_experts
++            moe.experts.update_expert_map()
++
++
++class _LayerGroup(nn.Module):
++    """Runs a fixed list of decoder layers; compiled as one region (layers unregistered on purpose)."""
++
++    def __init__(self, layers: list) -> None:
++        super().__init__()
++        self._group_layers = layers
++
++    def forward(self, hidden_states, positions, input_ids, state_writes, ple_meta=None):
++        writes = []
++        for layer in self._group_layers:
++            hidden_states, w = layer(hidden_states, positions, input_ids, state_writes, ple_meta)
++            if w is not None:
++                writes.append(w)
++        return hidden_states, writes
++
++
++class HpuQwen4ExpModel(nn.Module):
++    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        self.config = config
++        self.vocab_size = config.vocab_size
++        self.hc_count = int(config.hc_count)
++        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
++
++        def get_layer(prefix: str) -> HpuQwen4ExpDecoderLayer:
++            layer_idx = extract_layer_index(prefix)
++            return HpuQwen4ExpDecoderLayer(vllm_config, layer_type=config.layer_types[layer_idx], prefix=prefix)
++
++        self.start_layer, self.end_layer, self.layers = make_layers(config.num_hidden_layers, get_layer,
++                                                                    prefix=f"{prefix}.layers")
++        # Group consecutive layers into modules so the runner's regional compilation (one region per
++        # ModuleList child) compiles G layers as a single graph. Groups keep the layer modules in a plain
++        # list (unregistered) so parameter names / weight loading stay on ``self.layers``.
++        G = max(1, _LAYERS_PER_REGION)
++        real_layers = list(self.layers)[self.start_layer:self.end_layer]
++        self.layer_groups = nn.ModuleList(
++            [_LayerGroup(real_layers[i:i + G]) for i in range(0, len(real_layers), G)])
++        ple_layers = [l.ple for l in real_layers if getattr(l, "ple", None) is not None]
++        assert len(ple_layers) <= 1, "one PLE layer supported"
++        self._ple_layer = ple_layers[0] if ple_layers else None
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states"], config.hidden_size * config.hc_count)
++        hc_config = HyperConnectionConfig(hc_count=config.hc_count, hidden_size=config.hidden_size,
++                                          params_dtype=torch.bfloat16, hc_lowrank=config.hc_lowrank,
++                                          rms_norm_eps=config.rms_norm_eps, hc_per_branch_norm=True)
++        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
++                intermediate_tensors: IntermediateTensors | None = None,
++                inputs_embeds: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
++        if inputs_embeds is not None:
++            hidden_states = inputs_embeds
++        else:
++            if input_ids is None:
++                raise ValueError("input_ids or inputs_embeds is required")
++            hidden_states = self.embed_input_ids(input_ids)
++        rep = [1] * (hidden_states.dim() - 1) + [self.hc_count]
++        hidden_states = hidden_states.repeat(*rep)
++        # Resolve PLE metadata eagerly (outside any compiled region) so lengths / state slots are graph inputs.
++        ple_meta = None
++        if self._ple_layer is not None and input_ids is not None:
++            ple_meta = self._ple_layer.get_meta(input_ids)
++
++        if _DEBUG:
++            _dbg("embed", hidden_states, input_ids)
++            md = get_forward_context().attn_metadata
++            _dbg("meta", getattr(md, "load_indices_tensor", None) if md is not None else None,
++                 getattr(md, "has_initial_states_p", None) if md is not None else None,
++                 getattr(md, "query_start_loc_p", None) if md is not None else None)
++            for li in (0, 1):
++                lyr = self.layers[li]
++                if getattr(lyr, "ple", None) is not None and len(lyr.ple.kv_cache) == 2:
++                    _dbg(f"state.ple{li}", lyr.ple.kv_cache[0], lyr.ple.kv_cache[1])
++                if hasattr(lyr, "linear_attn") and len(lyr.linear_attn.kv_cache) == 2:
++                    _dbg(f"state.gdn{li}", lyr.linear_attn.kv_cache[0], lyr.linear_attn.kv_cache[1])
++        if _DEBUG and _marker("QWEN4_DEBUG_GROUPS"):
++            # probes per group, keeping the production (grouped) execution path
++            for gi, group in enumerate(self.layer_groups):
++                hidden_states, _w = group(hidden_states, positions, input_ids, True, ple_meta)
++                _dbg_rows(f"group{gi}", hidden_states)
++        elif _DEBUG:
++            for i, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
++                hidden_states = layer(hidden_states, positions, input_ids, None, ple_meta)
++                if i < 4 or i % 8 == 7 or i == self.end_layer - 1:
++                    _dbg(f"layer{i}", hidden_states)
++        else:
++            for group in self.layer_groups:
++                hidden_states, writes = group(hidden_states, positions, input_ids, True, ple_meta)
++                for (idx, new_conv, new_tok), layer in zip(writes, [l for l in group._group_layers if l.ple is not None]):
++                    # eager, outside the compiled region
++                    layer.ple.kv_cache[0].index_copy_(0, idx, new_conv)
++                    layer.ple.kv_cache[1].index_copy_(0, idx, new_tok)
++
++        sample_hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
++        if _DEBUG: _dbg("final", sample_hidden_states)
++        return sample_hidden_states
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        weights = maybe_fuse_shared_experts(weights, enabled=False,
++                                            n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
++                                            n_shared_experts=1, ckpt_prefix="mlp.shared_expert")
++        skip_substrs = ("hashstats_", "token_lookup", "hyper_connection_mixer.block_inject_weight")
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr={s: None for s in skip_substrs})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        return loader.load_weights(weights, mapper=mapper)
++
++
++class HpuQwen4ExpForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsMRoPE, SupportsPP,
++                             HpuQwen4ExpMixtureOfExperts, IsHybrid):
++    packed_modules_mapping = {
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
++        "in_proj_ba": ["in_proj_b", "in_proj_a"],
++    }
++    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
++    requires_raw_input_tokens = True
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
++        self.vllm_config = vllm_config
++        self.model_config = vllm_config.model_config
++        self.quant_config = vllm_config.quant_config
++        self.config = config
++        configure_markers(getattr(vllm_config.model_config, "model", None))
++        self.model = HpuQwen4ExpModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
++        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
++        self.set_moe_parameters(self.model.layers)
++
++    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
++        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def get_mrope_input_positions(self, input_tokens: list[int],
++                                  mm_features: list[MultiModalFeatureSpec]) -> tuple[torch.Tensor, int]:
++        positions = torch.arange(len(input_tokens), dtype=torch.long)
++        return positions.unsqueeze(0).expand(3, -1), 0
++
++    # --- hybrid cache spec plumbing ------------------------------------------
++    @classmethod
++    def get_ple_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype, ...]:
++        return ple_state_dtypes(vllm_config.model_config.dtype)
++
++    @classmethod
++    def get_ple_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        hf = vllm_config.model_config.hf_text_config
++        conv_state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
++        return ple_state_shapes(conv_state_len, int(hf.hidden_size) * int(hf.hc_count), int(hf.ngram_size) - 1)
++
++    @classmethod
++    def get_gdn_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
++        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(vllm_config.model_config.dtype,
++                                                                     vllm_config.cache_config.mamba_cache_dtype,
++                                                                     vllm_config.cache_config.mamba_ssm_cache_dtype)
++
++    @classmethod
++    def get_gdn_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        hf = vllm_config.model_config.hf_text_config
++        tp_size = 1 if _DENSE_REPLICATED else vllm_config.parallel_config.tensor_parallel_size
++        num_spec = (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
++        return MambaStateShapeCalculator.gated_delta_net_state_shape(tp_size, hf.linear_num_key_heads,
++                                                                     hf.linear_num_value_heads, hf.linear_key_head_dim,
++                                                                     hf.linear_value_head_dim,
++                                                                     hf.linear_conv_kernel_dim, num_spec)
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
++        return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
++        return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
++        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
++
++    @classmethod
++    def get_mamba_state_copy_funcs(cls, mamba_types: set[MambaAttentionBackendEnum]) -> MambaStateCopyFuncsByType:
++        funcs = {
++            MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func(),
++            MambaAttentionBackendEnum.SHORT_CONV: MambaStateCopyFuncCalculator.short_conv_state_copy_func(),
++        }
++        return {t: funcs[t] for t in mamba_types}
++
++    @classmethod
++    def get_mamba_specs_from_config(cls, vllm_config: VllmConfig) -> tuple[MambaSpec, ...]:
++        return (
++            MambaSpec(shapes=cls.get_gdn_mamba_state_shape_from_config(vllm_config),
++                      dtypes=cls.get_gdn_mamba_state_dtype_from_config(vllm_config), block_size=-1),
++            MambaSpec(shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
++                      dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config), block_size=-1,
++                      tp_replicated=True),
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr={"mtp.": None})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        with _load_ctx():
++            return loader.load_weights(weights, mapper=mapper)
++
++
++class HpuQwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
++
++    def get_hf_config(self) -> Qwen4ExpConfig:
++        return self.ctx.get_hf_config(Qwen4ExpConfig)
++
++
++@MULTIMODAL_REGISTRY.register_processor(Qwen3VLMultiModalProcessor, info=HpuQwen4ExpProcessingInfo,
++                                        dummy_inputs=Qwen3VLDummyInputsBuilder)
++class HpuQwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration, HasInnerState,
++                                          HpuQwen4ExpMixtureOfExperts):
++    """Qwen3-VL vision tower backed by the HPU Qwen4Exp language model."""
++
++    requires_raw_input_tokens = True
++    packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
++        nn.Module.__init__(self)
++        config: Qwen4ExpConfig = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++        if multimodal_config is None:
++            raise ValueError("Qwen4ExpForConditionalGeneration requires multimodal_config")
++        self.config = config
++        self.model_config = vllm_config.model_config
++        self.multimodal_config = multimodal_config
++        self.language_model_only = multimodal_config.language_model_only
++        configure_markers(getattr(vllm_config.model_config, "model", None))
++        if self.language_model_only:
++            self.use_data_parallel = False
++            self.is_multimodal_pruning_enabled = False
++            self.video_pruning_method = None
++            self.video_pruning_rate = 0.0
++            self._tokenizer = None
++            self.visual = StageMissingLayer("vision_tower")
++            self._tower_model_names = []
++        else:
++            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++            self._init_video_pruning(multimodal_config)
++            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
++            with self._mark_tower_model(vllm_config, {"image", "video"}):
++                self.visual = Qwen3_VisionTransformer(config.vision_config, norm_eps=config.text_config.rms_norm_eps,
++                                                      quant_config=quant_config, prefix=maybe_prefix(prefix, "visual"))
++        self.use_deepstack = False
++        self.deepstack_num_level = 0
++        self.visual_dim = config.vision_config.out_hidden_size
++        self.multiscale_dim = 0
++        with self._mark_language_model(vllm_config):
++            self.language_model = HpuQwen4ExpForCausalLM(vllm_config=vllm_config,
++                                                         prefix=maybe_prefix(prefix, "language_model"))
++        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
++        self.set_moe_parameters(self.language_model.model.layers)
++
++    def embed_input_ids(self, input_ids: torch.Tensor, multimodal_embeddings: MultiModalEmbeddings | None = None, *,
++                        is_multimodal: torch.Tensor | None = None) -> torch.Tensor:
++        inputs_embeds = self._embed_text_input_ids(input_ids, self.language_model.embed_input_ids,
++                                                   is_multimodal=is_multimodal)
++        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
++            return inputs_embeds
++        if self.language_model_only:
++            raise ValueError("language_model_only does not accept multimodal embeddings")
++        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
++        from vllm.model_executor.models.interfaces import _require_is_multimodal
++        is_multimodal = _require_is_multimodal(is_multimodal)
++        return _merge_multimodal_embeddings(inputs_embeds=inputs_embeds, multimodal_embeddings=multimodal_embeddings,
++                                            is_multimodal=is_multimodal)
++
++    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
++        if intermediate_tensors is not None:
++            inputs_embeds = None
++        return self.language_model.model(input_ids=input_ids, positions=positions,
++                                         intermediate_tensors=intermediate_tensors, inputs_embeds=inputs_embeds)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(
++            orig_to_new_substr={"mtp.": None},
++            orig_to_new_prefix={"visual.": None} if self.language_model_only else {})
++        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=_IGNORED_SUFFIXES.copy())
++        with _load_ctx():
++            return loader.load_weights(weights, mapper=mapper)
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_shape_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_copy_func(cls):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_copy_func()
++
++    @classmethod
++    def get_mamba_state_copy_funcs(cls, mamba_types):
++        return HpuQwen4ExpForCausalLM.get_mamba_state_copy_funcs(mamba_types)
++
++    @classmethod
++    def get_mamba_specs_from_config(cls, vllm_config):
++        return HpuQwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
++
++
++__all__ = ["HpuQwen4ExpForCausalLM", "HpuQwen4ExpForConditionalGeneration", "HpuQwen4ExpPLELayer"]
+diff --git a/vllm_gaudi/models/qwen4_exp_ngram_hash.py b/vllm_gaudi/models/qwen4_exp_ngram_hash.py
+new file mode 100644
+index 0000000..3eab349
+--- /dev/null
++++ b/vllm_gaudi/models/qwen4_exp_ngram_hash.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU-safe n-gram hashing for the Qwen4Exp PLE layer.
++
++Gaudi TPC integer arithmetic is effectively 32-bit: int64 multiply, xor,
++shift and remainder silently truncate.  The upstream hash needs exact
++64-bit wraparound multiply / xor followed by ``torch.remainder`` (signed,
++floor semantics).  We reproduce it bit-exactly with int32 tensors by
++splitting the 63-bit multipliers into 8-bit limbs and reducing modulo the
++per-head vocabulary size with a nibble-wise Horner scheme (all
++intermediates stay below 2**31).
++"""
++import torch
++
++_MASK64 = (1 << 64) - 1
++_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
++_SPLITMIX_M1 = 0xBF58476D1CE4E5B9
++_SPLITMIX_M2 = 0x94D049BB133111EB
++_PLE_LAYER_PRIME = 10007
++
++
++def _splitmix64(value: int) -> int:
++    value = (value + _SPLITMIX_GAMMA) & _MASK64
++    value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
++    value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
++    return (value ^ (value >> 31)) & _MASK64
++
++
++def _is_prime_64(value: int) -> bool:
++    if value < 2:
++        return False
++    for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if value % prime == 0:
++            return value == prime
++    exponent = value - 1
++    shifts = 0
++    while exponent % 2 == 0:
++        exponent //= 2
++        shifts += 1
++    for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
++        if base % value == 0:
++            continue
++        witness = pow(base, exponent, value)
++        if witness in (1, value - 1):
++            continue
++        for _ in range(shifts - 1):
++            witness = pow(witness, 2, value)
++            if witness == value - 1:
++                break
++        else:
++            return False
++    return True
++
++
++def _nth_prime_after(start: int, count: int) -> int:
++    prime = int(start)
++    for _ in range(count):
++        candidate = prime + 1
++        if candidate <= 2:
++            prime = 2
++            continue
++        if candidate % 2 == 0:
++            candidate += 1
++        while not _is_prime_64(candidate):
++            candidate += 2
++        prime = candidate
++    return prime
++
++
++def make_layer_multipliers(*, ngram_size: int, unigram_vocab_size: int, seed: int, ple_dense_layer_id: int) -> list[int]:
++    max_multiplier = ((1 << 63) - 1) // unigram_vocab_size
++    half_bound = max(1, max_multiplier // 2)
++    base_seed = seed + _PLE_LAYER_PRIME * ple_dense_layer_id
++    multipliers = []
++    for index in range(ngram_size):
++        value = base_seed + _SPLITMIX_GAMMA * (index + 1)
++        multipliers.append(2 * (_splitmix64(value) % half_bound) + 1)
++    return multipliers
++
++
++def make_vocab_layout(*, ngram_vocab_size_base: int, ngram_heads: int,
++                      ple_dense_layer_id: int) -> tuple[list[int], list[int], int]:
++    sizes: list[int] = []
++    offsets: list[int] = []
++    offset = 0
++    for local_head in range(ngram_heads):
++        global_head = ple_dense_layer_id * ngram_heads + local_head
++        size = _nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)
++        sizes.append(size)
++        offsets.append(offset)
++        offset += size
++    return sizes, offsets, offset
++
++
++class NgramHasher(torch.nn.Module):
++    """Bit-exact int32 re-implementation of Qwen4ExpNGramEmbedding.compute_ngram_ids.
++
++    An ``nn.Module`` so the constant tables are registered buffers (moved with the
++    model, proper graph inputs) — never mutate Python-object tensor attributes inside
++    a compiled forward on HPU (graph-output aliasing hazard).
++    """
++
++    def __init__(self, multipliers: list[int], sizes: list[int], offsets: list[int], heads_per_ngram: int,
++                 ngram_size: int, device=None):
++        super().__init__()
++        assert ngram_size == 3, "only bigram+trigram layout is implemented"
++        assert all(s < (1 << 30) for s in sizes)
++        self.ngram_size = ngram_size
++        self.heads_per_ngram = heads_per_ngram
++        # 8-bit limbs of each multiplier: [ngram_size, 8], little endian
++        limbs = [[(m >> (8 * i)) & 0xFF for i in range(8)] for m in multipliers]
++        self.register_buffer("limbs", torch.tensor(limbs, dtype=torch.int32, device=device), persistent=False)
++        self.register_buffer("sizes", torch.tensor(sizes, dtype=torch.int32, device=device), persistent=False)
++        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.int32, device=device), persistent=False)
++        # correction for signed torch.remainder semantics: 2**64 mod size
++        self.register_buffer("two64_mod", torch.tensor([(1 << 64) % s for s in sizes], dtype=torch.int32,
++                                                       device=device), persistent=False)
++
++    def _mul_limbs(self, tok: torch.Tensor, n: int) -> torch.Tensor:
++        """tok (< 2**18, int32 [...]) * multiplier[n] mod 2**64 as 8 little-endian 8-bit limbs [..., 8]."""
++        out = []
++        carry = torch.zeros_like(tok)
++        for i in range(8):
++            c = tok * self.limbs[n, i] + carry  # < 2**26 + 2**19
++            out.append(torch.bitwise_and(c, 0xFF))
++            carry = c >> 8
++        return torch.stack(out, dim=-1)
++
++    def _mod_heads(self, limbs: torch.Tensor, head_slice: slice) -> torch.Tensor:
++        """limbs [..., 8] (unsigned 64-bit value) -> signed-remainder per head [..., heads]."""
++        sizes = self.sizes[head_slice]  # [h]
++        corr = self.two64_mod[head_slice]
++        offs = self.offsets[head_slice]
++        r = torch.zeros(limbs.shape[:-1] + (sizes.numel(), ), dtype=torch.int32, device=limbs.device)
++        for i in range(7, -1, -1):
++            limb = limbs[..., i:i + 1]
++            hi = limb >> 4
++            lo = torch.bitwise_and(limb, 0xF)
++            r = torch.remainder(r * 16 + hi, sizes)
++            r = torch.remainder(r * 16 + lo, sizes)
++        # signed int64 interpretation when bit 63 set
++        neg = (limbs[..., 7:8] >= 128)
++        r_signed = torch.remainder(r - corr + sizes, sizes)
++        r = torch.where(neg, r_signed, r)
++        return r + offs
++
++    def forward(self, t0: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
++        """t0/t1/t2: int32 tensors [...] of current / previous / previous-previous token ids
++        (already EOS-masked).  Returns int32 ids [..., 2*heads_per_ngram]."""
++        p0 = self._mul_limbs(t0, 0)
++        p1 = self._mul_limbs(t1, 1)
++        p2 = self._mul_limbs(t2, 2)
++        bi = torch.bitwise_xor(p0, p1)
++        tri = torch.bitwise_xor(bi, p2)
++        h = self.heads_per_ngram
++        ids_bi = self._mod_heads(bi, slice(0, h))
++        ids_tri = self._mod_heads(tri, slice(h, 2 * h))
++        return torch.cat([ids_bi, ids_tri], dim=-1)
++
++
++def reference_ngram_ids(t0, t1, t2, multipliers, sizes, offsets, heads_per_ngram):
++    """CPU int64 reference reproducing upstream compute_ngram_ids for shifted tokens."""
++    m = torch.tensor(multipliers, dtype=torch.int64)
++    sizes = torch.tensor(sizes, dtype=torch.int64)
++    offsets = torch.tensor(offsets, dtype=torch.int64)
++    t0, t1, t2 = (t.to(torch.int64) for t in (t0, t1, t2))
++    out = []
++    for ngram in (2, 3):
++        start = (ngram - 2) * heads_per_ngram
++        end = start + heads_per_ngram
++        mixed = t0 * m[0]
++        mixed = torch.bitwise_xor(mixed, t1 * m[1])
++        if ngram == 3:
++            mixed = torch.bitwise_xor(mixed, t2 * m[2])
++        out.append(torch.remainder(mixed.unsqueeze(-1), sizes[start:end]) + offsets[start:end])
++    return torch.cat(out, dim=-1)
+diff --git a/vllm_gaudi/ops/hpu_fp8.py b/vllm_gaudi/ops/hpu_fp8.py
+index 322b681..9ca31e7 100644
+--- a/vllm_gaudi/ops/hpu_fp8.py
++++ b/vllm_gaudi/ops/hpu_fp8.py
+@@ -309,6 +309,11 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+             )
+         if self.block_quant:
+             layer = hpu_ops.fp8_block_moe_prepare_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
++            import os as _os
++            if _HPU_MOE_GATHER and _os.path.exists("/work/QWEN4_MOE_FAST"):
++                # packed pre-transposed expert rows for the low-batch gather path (opt-in marker file)
++                from vllm_gaudi.ops.hpu_moe_gather_fast import pack_expert_weights
++                pack_expert_weights(layer)
+         else:
+             if self.quant_config.activation_scheme == "static":
+                 if (layer.w13_input_scale is None or layer.w2_input_scale is None):
+@@ -393,6 +398,9 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+                 _verify_moe_combine(stock, custom)
+                 del stock
+                 output = custom
++            elif getattr(layer, "moe_packed", None) is not None:
++                from vllm_gaudi.ops.hpu_moe_gather_fast import gather_silu_fp8_moe_fast
++                output = gather_silu_fp8_moe_fast(layer, x, topk_ids, topk_weights)
+             else:
+                 output = gather_silu_fp8_moe(layer, x, topk_ids, topk_weights)
+         else:
+diff --git a/vllm_gaudi/ops/hpu_moe_gather_fast.py b/vllm_gaudi/ops/hpu_moe_gather_fast.py
+new file mode 100644
+index 0000000..b8a74bb
+--- /dev/null
++++ b/vllm_gaudi/ops/hpu_moe_gather_fast.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Low-batch FP8 MoE path with one packed expert-weight gather and batched bf16 GEMMs (no weight transposes).
++
++Per decode step the reference gather path (hpu_moe_combine.gather_silu_fp8_moe) issues ~13 gathers, ~30 DMA
++transposes (permute of the gathered fp8 weights) and an fp32 dequant of w2 per layer. Here each expert's
++w13^T ([H, 2I]) and w2^T ([I, H]) are stored pre-transposed and packed into one fp8 row per expert at load time,
++so a step needs: one index_select of G rows, one bf16 dequant of the gathered rows, two batched bf16 GEMMs,
++silu*up and the weighted sum. Numerics: same per-channel FP8 weights as the stock path; activations stay bf16
++(no activation quantization), so accuracy is at least as good as the stock op.
++"""
++import torch
++
++
++def pack_expert_weights(layer) -> None:
++    """Build layer.moe_packed [E, P] fp8 view-as-uint8? No: keep fp8 dtype; plus packed per-channel scales."""
++    w13 = layer.w13_weight  # [E, 2I, H] fp8
++    w2 = layer.w2_weight  # [E, H, I] fp8
++    E, twoI, H = w13.shape
++    I = w2.shape[-1]
++    w13t = w13.transpose(1, 2).reshape(E, H * twoI)  # [E, H*2I]  (row-major [H, 2I])
++    w2t = w2.transpose(1, 2).reshape(E, I * H)  # [E, I*H]      (row-major [I, H])
++    layer.moe_packed = torch.cat([w13t, w2t], dim=1).contiguous()  # [E, H*2I + I*H] fp8
++    s13 = layer.w13_weight_scale_inv.float()  # [E, 2I]
++    s2 = layer.w2_weight_scale_inv.float()  # [E, H]
++    layer.moe_packed_scale = torch.cat([s13, s2], dim=1).contiguous()  # [E, 2I + H] f32
++    layer.moe_packed_dims = (E, H, I)
++
++
++def gather_silu_fp8_moe_fast(layer, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
++    E, H, I = layer.moe_packed_dims
++    tokens, K = topk_ids.shape
++    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
++    local_ids = topk_ids - experts_min
++    in_range = (local_ids >= 0) & (local_ids < E)
++    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
++    safe_w = torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).to(x.dtype)
++    G = min(E, tokens * K)
++    gate_weights = x.new_zeros(tokens, E)
++    gate_weights.scatter_add_(1, safe_ids, safe_w)  # [T, E]
++    hit = (gate_weights != 0).to(torch.float32).sum(0)
++    gather_ids = torch.topk(hit, G, sorted=False).indices  # [G]
++    rows = layer.moe_packed.index_select(0, gather_ids)  # [G, P] fp8  (one gather)
++    srow = layer.moe_packed_scale.index_select(0, gather_ids)  # [G, 2I+H] f32
++    w13t = rows[:, :H * 2 * I].reshape(G, H, 2 * I)
++    w2t = rows[:, H * 2 * I:].reshape(G, I, H)
++    s13 = srow[:, :2 * I].to(x.dtype).unsqueeze(1)  # [G,1,2I]
++    s2 = srow[:, 2 * I:].to(x.dtype).unsqueeze(1)  # [G,1,H]
++    w13b = w13t.to(x.dtype) * s13  # [G, H, 2I] bf16 (dequant)
++    w2b = w2t.to(x.dtype) * s2  # [G, I, H]  bf16
++    xg = x.unsqueeze(0).expand(G, tokens, H)
++    proj = torch.bmm(xg, w13b)  # [G, T, 2I]
++    gate, up = proj[..., :I], proj[..., I:]
++    act = torch.nn.functional.silu(gate) * up  # [G, T, I]
++    outs = torch.bmm(act, w2b)  # [G, T, H]
++    gw = gate_weights.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
++    return (outs * gw).sum(0)
+diff --git a/vllm_gaudi/ops/hpu_topk_topp.py b/vllm_gaudi/ops/hpu_topk_topp.py
+new file mode 100644
+index 0000000..37a460f
+--- /dev/null
++++ b/vllm_gaudi/ops/hpu_topk_topp.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU fast path for top-k + top-p sampling masks.
++
++Upstream ``apply_top_k_top_p_pytorch`` sorts the full vocabulary (248k for Qwen3.8) with a bitonic sort on HPU
++(~3 ms per decode step at batch 1). When every request's top-k is <= ``_K_CAP`` we take the top-``_K_CAP``
++candidates with ``torch.topk`` (static shape, compile friendly), apply the per-row top-k and top-p masks on
++those candidates exactly as upstream does on the sorted full vocab, and scatter back. Results are identical
++because entries outside the top-k are -inf in both formulations.
++"""
++import torch
++
++_K_CAP = 256
++
++
++def apply_top_k_top_p_hpu(logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None) -> torch.Tensor:
++    if k is None:
++        return _orig(logits, k, p)
++    vocab = logits.shape[-1]
++    if vocab <= _K_CAP:
++        return _orig(logits, k, p)
++    # Data-dependent guard would sync; keep it static: only valid if all k <= _K_CAP. Callers with larger k
++    # get masked to the top _K_CAP candidates (clamp) — acceptable for sampling (k > 256 is unusual).
++    kk = torch.clamp(k.to(torch.long), max=_K_CAP)
++    top_vals, top_idx = torch.topk(logits, _K_CAP, dim=-1)  # descending, [B, K]
++    ranks = torch.arange(_K_CAP, device=logits.device).unsqueeze(0)  # [1, K]
++    top_vals = top_vals.masked_fill(ranks >= kk.unsqueeze(1), -float("inf"))
++    if p is not None:
++        # cumulative prob from the largest; drop tokens once mass before them already exceeds p
++        probs = top_vals.softmax(dim=-1)
++        cum = torch.cumsum(probs, dim=-1)
++        prev = cum - probs
++        top_p_mask = prev > p.unsqueeze(1)
++        top_vals = top_vals.masked_fill(top_p_mask, -float("inf"))
++    out = torch.full_like(logits, -float("inf"))
++    return out.scatter_(dim=-1, index=top_idx, src=top_vals)
++
++
++def install() -> None:
++    global _orig
++    import vllm.v1.sample.ops.topk_topp_sampler as m
++    if getattr(m, "_hpu_fast_topk_installed", False):
++        return
++    _orig = m.apply_top_k_top_p_pytorch
++    m.apply_top_k_top_p_pytorch = apply_top_k_top_p_hpu
++    m._hpu_fast_topk_installed = True
+diff --git a/vllm_gaudi/platform.py b/vllm_gaudi/platform.py
+index 8fba893..b45f4c1 100644
+--- a/vllm_gaudi/platform.py
++++ b/vllm_gaudi/platform.py
+@@ -36,6 +36,8 @@ torch.accelerator.get_memory_info = _hpu_get_memory_info
+ QWEN3_5_HYBRID_ARCHS = frozenset({
+     "Qwen3_5ForConditionalGeneration",
+     "Qwen3_5MoeForConditionalGeneration",
++    "Qwen4ExpForCausalLM",
++    "Qwen4ExpForConditionalGeneration",
+ })
+ 
+ 
+@@ -136,6 +138,14 @@ class HpuPlatform(Platform):
+ 
+         return total_hpu_memory
+ 
++    @classmethod
++    def check_runner_kv_caches_multi_layer(cls) -> None:
++        # The HPU runner keeps kv_caches as an unordered list of per-layer
++        # tuples (attention: (k, v, ...), mamba: state tensors); nothing indexes
++        # it by decoder-layer position, so hybrid layers that share a layer
++        # index (e.g. Qwen4Exp GDN + PLE in the same block) are fine.
++        return
++
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+         # Apply torch.compile/eager-only env defaults here (engine construction
+diff --git a/vllm_gaudi/v1/worker/hpu_input_batch.py b/vllm_gaudi/v1/worker/hpu_input_batch.py
+index 68300e6..e7db457 100644
+--- a/vllm_gaudi/v1/worker/hpu_input_batch.py
++++ b/vllm_gaudi/v1/worker/hpu_input_batch.py
+@@ -637,6 +637,14 @@ class InputBatch:
+     ) -> SamplingMetadata:
+         req_indices: list[int] = [self.req_id_to_index[req_id] for req_id, _ in req_id_output_token_ids]
+         prompt_token_ids = None
++        # Fast path: unchanged batch and same request selection -> reuse the device-side per-request
++        # tensors. Indexing device tensors with a Python list (``self.temperature[req_indices]``) costs a
++        # blocking host->device copy each (~0.7 ms on HPU, 6 of them per step at batch 1).
++        cache = getattr(self, "_selective_md_cache", None)
++        if skip_copy and cache is not None and cache[0] == tuple(req_indices) and self.no_penalties \
++                and self.no_allowed_token_ids:
++            import dataclasses
++            return dataclasses.replace(cache[1], output_token_ids=[toks for _, toks in req_id_output_token_ids])
+         if not skip_copy:
+             async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices)
+             async_h2d_update(self.top_p_cpu_tensor, self.top_p, req_indices)
+@@ -681,7 +689,7 @@ class InputBatch:
+             assert self.allowed_token_ids_mask_cpu_tensor is not None
+             async_h2d_update(self.allowed_token_ids_mask_cpu_tensor, self.allowed_token_ids_mask, req_indices)
+             allowed_token_ids_mask = self.allowed_token_ids_mask[req_indices]
+-        return SamplingMetadata(
++        md = SamplingMetadata(
+             temperature=self.temperature[req_indices],
+             all_greedy=self.all_greedy,
+             all_random=self.all_random,
+@@ -702,6 +710,8 @@ class InputBatch:
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
+         )
++        self._selective_md_cache = (tuple(req_indices), md)
++        return md
+ 
+     def set_async_sampled_token_ids(
+         self,
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 1d7b908..8ce4605 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -161,7 +161,8 @@ except ImportError:
+ _GDN_MAMBA_TYPES: tuple[object, ...] = ("gdn_attention", "linear_attention")
+ try:
+     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+-    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, "gdn_attention",
++    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR,
++                        MambaAttentionBackendEnum.SHORT_CONV, "gdn_attention",
+                         "linear_attention")
+ except (ImportError, AttributeError):
+     pass
+@@ -791,11 +792,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+ 
+     mamba_like_arch = [
+         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
+-        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
++        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"
+     ]
+     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
+         return
+-    mamba_like_layer = ['.mixer', '.linear_attn']
++    mamba_like_layer = ['.mixer', '.linear_attn', '.ple']
+ 
+     def _get_decoder_layer_by_idx(model_obj, idx: int):
+         # Qwen3.5 multimodal path: model.language_model.model.layers
+@@ -839,6 +840,12 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+                 layer = _get_decoder_layer_by_idx(model, layer_idx)
+                 if layer is not None and hasattr(layer, "linear_attn"):
+                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
++            elif layer_name.endswith('.ple'):
++                # Qwen4Exp PLE (n-gram) layer: short-conv + token state in its own cache group.
++                layer_idx = int(layer_name.split('.')[-2])
++                layer = _get_decoder_layer_by_idx(model, layer_idx)
++                if layer is not None and getattr(layer, "ple", None) is not None:
++                    layer.ple.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
+ 
+ 
+ def maybe_set_chunked_attention_layers(model_runner):
+@@ -880,7 +887,7 @@ def apply_model_specific_patches(model_runner):
+ 
+     is_llama4 = is_hpu_llama4_model(model_runner.model)
+     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
+-    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
++    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen4_exp", "qwen4_exp_text")
+     is_gemma4 = model_type in ("gemma4", )
+ 
+     model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
+@@ -1602,6 +1609,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
+ 
+     def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
++        if os.getenv("VLLM_QWEN4_FAST_STATE_IDX", "0") == "1" and self._compact_gdn_group_ids:
++            fast = self._prepare_mamba_state_idxs_fast(req_indices, block_table_offsets, target_bs)
++            if getattr(self, "_fast_idx_checks", 0) < 8:  # self-check the first calls against the reference loop
++                self._fast_idx_checks = getattr(self, "_fast_idx_checks", 0) + 1
++                ref = self._prepare_mamba_state_idxs_ref(req_indices, block_table_offsets, target_bs)
++                if not torch.equal(fast, ref):
++                    logger.error("fast mamba state idx mismatch: fast=%s ref=%s", fast.tolist(), ref.tolist())
++                    return ref
++            return fast
++        return self._prepare_mamba_state_idxs_ref(req_indices, block_table_offsets, target_bs)
++
++    def _prepare_mamba_state_idxs_ref(self, req_indices, block_table_offsets, target_bs):
+         num_indices = len(req_indices)
+         all_state_indices_cpu = []
+         for group_idx in range(len(self.input_batch.block_table.block_tables)):
+@@ -1625,6 +1644,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+ 
+         return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+ 
++    def _prepare_mamba_state_idxs_fast(self, req_indices, block_table_offsets, target_bs):
++        """Vectorised equivalent of prepare_mamba_state_idxs (one tensor op per non-compact group instead of a
++        Python loop over every cache group and request; ~1.6 ms/step on a 49-group model)."""
++        num_groups = len(self.input_batch.block_table.block_tables)
++        num_indices = len(req_indices)
++        cache = getattr(self, "_fast_idx_cache", None)
++        if cache is None or cache[0] != num_groups:
++            compact = torch.tensor([g in self._compact_gdn_group_ids for g in range(num_groups)], dtype=torch.bool)
++            goff = torch.tensor([self._compact_gdn_group_offset.get(g, 0) for g in range(num_groups)], dtype=torch.int32)
++            pad = torch.where(compact, torch.tensor(-1, dtype=torch.int32), torch.tensor(self._MAMBA_PAD_BLOCK_ID, dtype=torch.int32))
++            cache = (num_groups, compact, goff, pad, [g for g in range(num_groups) if g not in self._compact_gdn_group_ids])
++            self._fast_idx_cache = cache
++        _, compact, goff, pad, non_compact = cache
++        out = pad.view(num_groups, 1).repeat(1, target_bs)  # [num_groups, target_bs] filled with per-group padding
++        if num_indices:
++            base = torch.tensor([self._gdn_req_to_base_slot[self.input_batch.req_ids[r]] for r in req_indices], dtype=torch.int32)
++            rows = base.view(1, -1) * self._num_gdn_groups + goff.view(-1, 1) + 1  # [num_groups, N]
++            out[:, :num_indices] = torch.where(compact.view(-1, 1), rows, out[:, :num_indices])
++            if non_compact:
++                idx = torch.as_tensor(req_indices, dtype=torch.long)
++                offs = torch.as_tensor(block_table_offsets, dtype=torch.long)
++                for g in non_compact:
++                    bt = self.input_batch.block_table[g].get_cpu_tensor()
++                    out[g, :num_indices] = bt[idx, offs].to(torch.int32)
++        return out
++
+     def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: list[int], is_prompt: bool):
+         '''
+         This is a helper function to create the mask for lora computations.
+@@ -5018,6 +5063,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         1. Children of the nn.ModuleList
+         2. Member of regional_compilation_layers_list
+         """
++        if getattr(module, "_no_regional_compile", False):
++            return  # model opts out (e.g. layers already fused into larger regions by the model itself)
+         if isinstance(module, torch.nn.ModuleList):
+             for children_name, children_module in module.named_children():
+                 self._compile_region(module, children_name, children_module)
+-- 
+2.53.0
+

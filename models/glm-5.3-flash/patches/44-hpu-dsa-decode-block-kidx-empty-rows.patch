@@ -1,0 +1,247 @@
+From f38399ef908de2153c4b047eb8050642556b700c Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 02:11:18 +0000
+Subject: [PATCH] HPU DSA decode: per-block logical index in decode metadata;
+ never emit all -inf block bias rows
+
+Contiguous PA orders block_list by physical block id and hybrid-model decode seq_lens_tensor holds
+scheduled tokens (1), so the sparse decode bias used wrong positions. The runner now emits block_kidx
+(logical block index per block_list entry) and the builder derives each sequence's current position
+from kidx*block_size+usage. Flat PA normalises attention per block, so all -inf rows (pad blocks,
+unselected real blocks) turned decode into NaN: pad rows keep the runner usage bias and empty real
+blocks get one -1e30 slot.
+
+---
+ vllm_gaudi/attention/oot_mla.py              |  4 +-
+ vllm_gaudi/ops/hpu_dsa_indexer.py            | 50 ++++++++++++++------
+ vllm_gaudi/v1/attention/backends/hpu_attn.py | 10 +++-
+ vllm_gaudi/v1/worker/hpu_model_runner.py     | 37 +++++++++++----
+ 4 files changed, 74 insertions(+), 27 deletions(-)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index b1f9049..981db6f 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -232,8 +232,10 @@ class HPUMLAAttention(MLAAttention):
+             return bias, None
+         blocks = self.indexer_kv.fetch_from_cache(self.indexer_cache.unflatten(0, (-1, attn_metadata.block_size)),
+                                                   attn_metadata.block_list)
++        assert attn_metadata.block_kidx is not None, "DSA sparse decode: runner did not provide block_kidx"
+         bias = decode_sparse_block_bias(qi, wi, blocks, ape, scale, attn_metadata.block_groups,
+-                                        attn_metadata.seq_lens_tensor, attn_metadata.attn_bias, topk, kpool)
++                                        attn_metadata.block_kidx, attn_metadata.block_usage,
++                                        attn_metadata.attn_bias, topk, kpool)
+         return None, bias
+             # NOTE(Xinyu): Make the loaded weight contiguous to avoid the transpose
+ 
+diff --git a/vllm_gaudi/ops/hpu_dsa_indexer.py b/vllm_gaudi/ops/hpu_dsa_indexer.py
+index f70e00e..c0f4a54 100644
+--- a/vllm_gaudi/ops/hpu_dsa_indexer.py
++++ b/vllm_gaudi/ops/hpu_dsa_indexer.py
+@@ -28,6 +28,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ _NEG = float("-inf")
++_EMPTY_BLOCK_BIAS = -1e30  # finite in bf16/fp32; exp(-1e30 - max) == 0
+ 
+ 
+ class HPUKpoolIndexer(nn.Module):
+@@ -114,30 +115,41 @@ def prefill_sparse_bias(q: torch.Tensor, kg: torch.Tensor, w: torch.Tensor, ape:
+ 
+ 
+ def decode_sparse_block_bias(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.Tensor, ape: torch.Tensor,
+-                             scale: float, block_groups: torch.Tensor, seq_lens: torch.Tensor,
+-                             base_bias: torch.Tensor, topk: int, kpool: int) -> torch.Tensor:
++                             scale: float, block_groups: torch.Tensor, block_kidx: torch.Tensor,
++                             block_usage: torch.Tensor, base_bias: torch.Tensor, topk: int,
++                             kpool: int) -> torch.Tensor:
+     """Per-block additive bias [N, block_size] for flat paged decode attention.
+ 
+-    q [Bp, H, D] / w [Bp, H]: the single decode token of each (padded) sequence; kg_blocks [N, block_size, 2D]:
+-    indexer cache rows of the padded block list (block i belongs to sequence block_groups[i], -1 for pad
+-    blocks; blocks of a sequence appear consecutively in position order); seq_lens [Bp]: sequence length
+-    including the current token; base_bias [N, block_size]: the runner's block-usage bias (0 / -inf).
++    q [Bp, H, D] / w [Bp, H]: the single decode token of each (padded) sequence.
++    kg_blocks [N, block_size, 2D]: indexer cache rows of the padded block list.
++    block_groups [N]: owning sequence of each block (-1 for pad blocks). Blocks may appear in any order
++    (contiguous PA orders them by physical id).
++    block_kidx [N]: logical index of each block inside its sequence (0 for pad blocks).
++    block_usage [N]: used slots per block (block_size except the sequence's last block, which holds the
++    current token). The current token position of sequence s is max over its blocks of
++    kidx * block_size + usage - 1.
++    base_bias [N, block_size]: the runner's block-usage bias (0 / -inf).
++    Allowed slots get 0, masked slots -inf; a real block with no allowed slot gets -1e30 in slot 0
++    (never an all -inf row, see below).
+     """
+     n, bs = kg_blocks.shape[:2]
+     bp = q.shape[0]
+     dev = q.device
+     assert bs % kpool == 0
+     pb = bs // kpool
+-    pk = pool_keys(kg_blocks, ape, kpool)  # [N, Pb, D]
++    is_real = block_groups >= 0
+     grp = block_groups.clamp(min=0)
++    kidx = block_kidx.to(torch.long)
++    pk = pool_keys(kg_blocks, ape, kpool)  # [N, Pb, D]
+     s = index_scores(q[grp].unsqueeze(1), pk, w[grp].unsqueeze(1), scale).squeeze(1)  # [N, Pb]
+-    # index of each block within its own sequence (blocks are consecutive per sequence)
+-    onehot = F.one_hot(torch.where(block_groups < 0, torch.full_like(block_groups, bp), block_groups),
+-                       num_classes=bp + 1).to(torch.float32)  # [N, Bp+1]
+-    kidx = ((onehot.cumsum(0) * onehot).sum(1) - 1).to(torch.long)  # [N]
+-    qpos = (seq_lens.to(torch.long) - 1)[grp]  # [N] position of the current token of the owning sequence
++    # current-token position of every sequence (static shapes: one-hot max instead of scatter)
++    last = kidx * bs + block_usage.to(torch.long) - 1  # [N]
++    gidx = torch.where(is_real, block_groups.to(torch.long), torch.full_like(kidx, bp))
++    onehot = F.one_hot(gidx, num_classes=bp + 1).to(torch.long)  # [N, Bp+1]
++    seq_qpos = (onehot * last.unsqueeze(1)).amax(dim=0)[:bp]  # [Bp]
++    qpos = seq_qpos[grp]  # [N]
+     pool_end = kidx.unsqueeze(1) * bs + torch.arange(pb, device=dev) * kpool + (kpool - 1)  # [N, Pb]
+-    valid = (pool_end <= qpos.unsqueeze(1)) & (block_groups >= 0).unsqueeze(1)
++    valid = (pool_end <= qpos.unsqueeze(1)) & is_real.unsqueeze(1)
+     fmin = torch.finfo(torch.float32).min
+     s = s.masked_fill(~valid, fmin).reshape(-1)  # [N*Pb]
+     valid = valid.reshape(-1)
+@@ -152,8 +164,16 @@ def decode_sparse_block_bias(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.
+     allowed = allowed.view(n, pb).repeat_interleave(kpool, dim=1)  # [N, block_size]
+     pos = kidx.unsqueeze(1) * bs + torch.arange(bs, device=dev).unsqueeze(0)  # [N, block_size]
+     tail = (pos >= ((qpos + 1) // kpool * kpool).unsqueeze(1)) & (pos <= qpos.unsqueeze(1))
+-    allowed |= tail
+-    return base_bias.masked_fill(~allowed, _NEG)
++    allowed |= tail & is_real.unsqueeze(1)
++    # Pad blocks keep the runner's usage bias (one live slot; group -1 is ignored by the kernel).
++    allowed |= ~is_real.unsqueeze(1)
++    bias = base_bias.masked_fill(~allowed, _NEG)
++    # Flat PA normalises attention per block (block_softmax): a real block with no selected slot would have
++    # block_max = -inf and turn the whole sequence into NaN. Give such blocks one finite, hugely negative slot
++    # so their softmax adjustment weight is exactly 0 instead.
++    empty = torch.isinf(bias).all(dim=1, keepdim=True)  # [N, 1]
++    first = torch.where(empty, torch.full_like(bias[:, :1], _EMPTY_BLOCK_BIAS), bias[:, :1])
++    return torch.cat([first, bias[:, 1:]], dim=1)
+ 
+ 
+ def dense_exact_len(topk: int, kpool: int) -> int:
+diff --git a/vllm_gaudi/v1/attention/backends/hpu_attn.py b/vllm_gaudi/v1/attention/backends/hpu_attn.py
+index 84a64a1..b92c9c4 100644
+--- a/vllm_gaudi/v1/attention/backends/hpu_attn.py
++++ b/vllm_gaudi/v1/attention/backends/hpu_attn.py
+@@ -65,6 +65,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
+     mamba_chunks_to_block_mapping: Optional[torch.Tensor] = None
+     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
+     window_block_list: Optional[torch.Tensor] = None
++    # Decode only: logical index of each block_list entry inside its own sequence's block table
++    # (0 for pad blocks). Contiguous PA orders block_list by physical block id, so position order is
++    # otherwise unrecoverable. Used by the DSA sparse decode bias (VLLM_HPU_DSA_SPARSE).
++    block_kidx: Optional[torch.Tensor] = None
+ 
+     def seq_len(self):
+         return self.slot_mapping.size(-1)
+@@ -135,7 +139,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
+                              load_indices_tensor=None,
+                              store_indices_tensor=None,
+                              query_start_loc=None,
+-                             seq_lens_tensor=None):
++                             seq_lens_tensor=None,
++                             block_kidx=None):
+         return cls(is_prompt=False,
+                    block_mapping=None,
+                    alibi_blocks=None,
+@@ -158,4 +163,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
+                    load_indices_tensor=load_indices_tensor,
+                    store_indices_tensor=store_indices_tensor,
+                    query_start_loc=query_start_loc,
+-                   query_start_loc_p=query_start_loc)
++                   query_start_loc_p=query_start_loc,
++                   block_kidx=block_kidx)
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 6c63ce0..ecbddde 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -1353,7 +1353,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
+         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
+         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
+         'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
+-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks'
++        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'block_kidx'
+     ])
+     return attention_metadata
+ 
+@@ -2618,7 +2618,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                                       slot_mapping,
+                                       batch_size,
+                                       block_size=None,
+-                                      force_non_contiguous=False):
++                                      force_non_contiguous=False,
++                                      return_kidx=False):
+         """Build paged attention buffers for decode.
+ 
+         Args:
+@@ -2631,6 +2632,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         last_block_usage = [slot[0] % block_size + 1 for slot in slot_mapping]
+         block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
+         block_usage = [[block_size] * (len(bt) - 1) + [lbu] for bt, lbu in zip(block_tables, last_block_usage) if bt]
++        block_kidx = flatten([list(range(len(bt))) for bt in block_tables]) if return_kidx else None
+         block_list = flatten(block_tables)
+         block_groups = flatten(block_groups)
+         block_usage = flatten(block_usage)
+@@ -2694,6 +2696,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         block_list = torch.tensor(block_list, dtype=torch.long, device='cpu')
+         block_groups = torch.tensor(block_groups, dtype=torch.long, device='cpu')
+         block_usage = torch.tensor(block_usage, dtype=self.model_config.dtype, device='cpu')
++        if return_kidx:
++            block_kidx = torch.tensor(padding_fn(block_kidx, 0), dtype=torch.long, device='cpu')
++            return block_list, block_groups, block_usage, block_kidx
+         return block_list, block_groups, block_usage
+ 
+     def _align_and_pad_mrope_positions(self, req_ids: list[str], context_lens: list[int], query_lens: list[int],
+@@ -3438,13 +3443,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         block_tables_list = self._resolve_all_blocks(block_tables_list)
+ 
+         # CONTEXT_LENS [batch_size]
+-        block_list, block_groups, block_usage = \
+-            self.get_habana_paged_attn_buffers(
+-                block_tables_list,
+-                slot_mapping.tolist(),
+-                padded_batch_size * num_tokens,
+-                block_size=decode_block_size,
+-            )
++        dsa_sparse = get_config().dsa_sparse
++        block_kidx = None
++        if dsa_sparse:
++            block_list, block_groups, block_usage, block_kidx = \
++                self.get_habana_paged_attn_buffers(
++                    block_tables_list,
++                    slot_mapping.tolist(),
++                    padded_batch_size * num_tokens,
++                    block_size=decode_block_size,
++                    return_kidx=True,
++                )
++        else:
++            block_list, block_groups, block_usage = \
++                self.get_habana_paged_attn_buffers(
++                    block_tables_list,
++                    slot_mapping.tolist(),
++                    padded_batch_size * num_tokens,
++                    block_size=decode_block_size,
++                )
+ 
+         if self.interleaved_sliding_window:
+             sliding_block_size = (self.sliding_window // decode_block_size)
+@@ -3525,6 +3542,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         block_usage_device = async_h2d_copy(block_usage, device=self.device)
+         block_groups_device = async_h2d_copy(block_groups, device=self.device)
+         slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
++        block_kidx_device = async_h2d_copy(block_kidx, device=self.device) if block_kidx is not None else None
+         window_block_list_device = async_h2d_copy(window_block_list,
+                                                   device=self.device) if self.interleaved_sliding_window else None
+         window_block_usage_device = async_h2d_copy(window_block_usage,
+@@ -3589,6 +3607,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             store_indices_tensor=store_indices_tensor,
+             seq_lens_tensor=seq_lens_tensor,
+             query_start_loc=query_start_loc_p,
++            block_kidx=block_kidx_device,
+         )
+ 
+         return DecodeInputData(num_decodes=num_decodes,
+-- 
+2.43.0
+

@@ -1,0 +1,60 @@
+From ecef62ff29efb5de8469abff28f69ee02f4de42f Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 04:04:48 +0000
+Subject: [PATCH] patch 54: eager fallback for the Triton-only fused_eh_norm
+ (HPU has no Triton)
+
+---
+ .../glm5next/nvidia/ops/fused_eh_norm.py      | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/vllm/models/glm5next/nvidia/ops/fused_eh_norm.py b/vllm/models/glm5next/nvidia/ops/fused_eh_norm.py
+index 095db3917..6bcce8c0c 100644
+--- a/vllm/models/glm5next/nvidia/ops/fused_eh_norm.py
++++ b/vllm/models/glm5next/nvidia/ops/fused_eh_norm.py
+@@ -49,6 +49,31 @@ def _fused_eh_norm_kernel(
+     tl.store(out_ptr + tok * out_stride + H + off, p_normed, mask=mask)
+ 
+ 
++def _eager_eh_norm(
++    positions: torch.Tensor,
++    inputs_embeds: torch.Tensor,
++    previous_hidden: torch.Tensor,
++    enorm_w: torch.Tensor,
++    hnorm_w: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    """Pure-torch equivalent of the Triton kernel, for backends without Triton (e.g. HPU).
++
++    Same three steps in the same order: zero the embeddings at position 0, RMS-normalise each half in fp32 with its
++    own weight, and write them side by side into [N, 2H].
++    """
++    dtype = inputs_embeds.dtype
++    e = inputs_embeds.float()
++    e = torch.where((positions == 0).unsqueeze(-1), torch.zeros_like(e), e)
++    p = previous_hidden.float()
++
++    def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++        rrms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
++        return (x * rrms) * w.float()
++
++    return torch.cat([_rms(e, enorm_w), _rms(p, hnorm_w)], dim=-1).to(dtype)
++
++
+ def fused_eh_norm(
+     positions: torch.Tensor,
+     inputs_embeds: torch.Tensor,
+@@ -58,6 +83,10 @@ def fused_eh_norm(
+     eps: float,
+ ) -> torch.Tensor:
+     """Returns cat([enorm(masked embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
++    from vllm.triton_utils import HAS_TRITON
++
++    if not HAS_TRITON:
++        return _eager_eh_norm(positions, inputs_embeds, previous_hidden, enorm_w, hnorm_w, eps)
+     n, h = inputs_embeds.shape
+     out = torch.empty(n, 2 * h, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+     _fused_eh_norm_kernel[(n,)](
+-- 
+2.43.0
+

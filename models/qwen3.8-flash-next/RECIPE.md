@@ -3,27 +3,33 @@
 Checkpoint: `orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8`  
 Hardware: 4× Intel Gaudi2 96 GB (one HLS-2 half). Two such replicas fit one 8-card box.
 
-## Serve (production setting used on bot2: 32K context, 4 sequences)
+## Serve (32K context, 4 sequences, TP=4)
 
 ```bash
 export PT_HPU_LAZY_MODE=0
+export PT_HPU_ENABLE_LAZY_COLLECTIVES=true
 export VLLM_SKIP_WARMUP=true
 export VLLM_HPU_FORCE_CHANNEL_FP8=true
 export VLLM_HPU_MOE_GATHER=1              # gathered-expert FP8 MoE (biggest single win)
 export ENABLE_EXPERIMENTAL_FLAGS=1
+export ENABLE_SKIP_REMOVAL_OF_GRAPH_INPUT_IDENTITY_NODES=true
+export VLLM_GRAPH_RESERVED_MEM=0.1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_PROMPT_SEQ_BUCKET_MAX=8192    # = the chunked-prefill chunk; never the full max-model-len
 export VLLM_DECODE_BLOCK_BUCKET_MAX=256   # max-model-len / 128
 export PT_HPU_RECIPE_CACHE_CONFIG=/path/to/recipe_cache,false,16384
 
 python3 -m vllm.entrypoints.openai.api_server \
-  --model orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8 \
+  --model /path/to/Qwen3.8-Flash-Next-FP8 \
   --served-model-name qwen3.8-flash-next \
   --tensor-parallel-size 4 --enable-expert-parallel \
+  --distributed-executor-backend mp \
   --dtype bfloat16 \
   --max-model-len 32768 --max-num-seqs 4 \
   --max-num-batched-tokens 8192 --enable-chunked-prefill \
   --num-gpu-blocks-override 4000 --gpu-memory-utilization 0.95 \
-  --no-enable-prefix-caching --language-model-only --trust-remote-code
+  --no-enable-prefix-caching --language-model-only --trust-remote-code \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
 ```
 
 Longer context: raise `--max-model-len` and `VLLM_DECODE_BLOCK_BUCKET_MAX` (= len/128); keep the prompt bucket at
@@ -33,7 +39,32 @@ Longer context: raise `--max-model-len` and `VLLM_DECODE_BLOCK_BUCKET_MAX` (= le
 Benchmark used: streamed chat completion, `temperature 0.7` (model defaults top-k 20 / top-p 0.95), thinking off,
 512 new tokens, 5 runs, nothing else running on the box → **38.7 tok/s median, 38.7 p90**.
 
+## Weights
+
+The port loads **stock FP8 block-quant** (`e4m3`, `weight_block_size [128,128]`, dynamic activations, n-gram 3 /
+`ngram_vocab_size_base=20e6` / PLE at layer 2). No custom n-gram table rewrite.
+
+- `Qwen/Qwen3.8-Flash-Next-FP8` — loaded and served. Same layout as the OrcaRouter uncensored FP8 used for the
+  numbers below. `--language-model-only` drops `model.visual.*`. If the runner asks for 3-D M-RoPE positions on a
+  text-only serve, strip `mrope_section` / `mrope_interleaved` from `text_config.rope_parameters` (1-D RoPE is
+  equivalent for text). Do not rewrite `modules_to_not_convert` on 0.29; that ignored-layers edit was a 0.28 leftover.
+- `orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8` — same quant + n-gram format, different post-train. Drop-in for this
+  port.
+
+Vision / MTP / QSA-indexer weights are present in the checkpoint; the mapper loads indexer tensors but does not use
+them (dense attention fallback). MTP is not wired.
+
+## Tool calling and thinking
+
+`--tool-call-parser qwen3_xml --reasoning-parser qwen3 --enable-auto-tool-choice`. Thinking off is
+`chat_template_kwargs.enable_thinking: false` (or a 400-token cap). Thinking on (`low`) was used for the 10/12
+arithmetic run at 3000 tokens. Both modes generate; tool-call markup is the Qwen3 XML parser. No later quality
+movement past **7/12** greedy / **10/12** thinking-on.
+
 ## Out-of-tree (required — the architecture is not supported by vllm-gaudi)
+
+The patch is [`patches/0001-qwen4-exp-hpu-port.patch`](patches/0001-qwen4-exp-hpu-port.patch) against vllm-gaudi
+`2dd55f97`. vLLM `98dff2a8` is stock. Container: [`docker/Dockerfile`](docker/Dockerfile).
 
 `qwen4_exp` is CUDA/ROCm-only upstream. The port lives in vllm-gaudi (`vllm_gaudi/models/qwen4_exp.py` and
 friends) and registers `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration`:
@@ -77,5 +108,9 @@ into larger regions is slower unless the collectives stay in-graph, which breaks
 
 ## Versions this recipe was measured on
 
-Habana **1.24.1**, vLLM **v0.29.0** (`98dff2a8`), vllm-gaudi **releases/v0.29.0** (`2dd55f97`) + the port above,
-transformers 5.16.1, torch 2.11.0a0. Measured 2026-09-12/13 on bot2.
+- Base image: `vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0` digest `sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8`
+- Pip pins that differ from the base: **transformers 5.16.1**, vLLM `0.29.0+g98dff2a81` (empty/HPU target), matching vllm-gaudi; torch stays the image's `2.11.0a0`. Full freeze: `docker/constraints.txt` (same pin set as the GLM image).
+- Host: Ubuntu 24.04.4, kernel **6.8.0-138-generic**, `habanalabs-dkms` **1.24.1-482**, driver **1.24.1-b336d5e**, HL-SMI `hl-1.24.0-fw-62.6.2.0`, SPI preboot **hl-gaudi2-1.24.0-fw-62.6.2-sec-11**, CPLD `0x10` (2023-10-30).
+- No custom ops / TPC / shared libraries.
+
+Measured 2026-09-12/13 on 4× Gaudi2 96 GB.

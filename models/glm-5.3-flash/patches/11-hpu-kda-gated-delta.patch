@@ -1,0 +1,453 @@
+From 3c341cad8c69920c8ea89ff44fe2b7e506f0dba8 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 11:43:48 +0000
+Subject: [PATCH] HPU KDA: bounded-sigmoid gate, per-channel recurrent,
+ Glm5NextLinearAttention swap
+
+---
+ vllm_gaudi/models/__init__.py     |   8 ++
+ vllm_gaudi/models/glm5next_kda.py | 201 +++++++++++++++++++++++++++++
+ vllm_gaudi/ops/hpu_kda_pytorch.py | 204 ++++++++++++++++++++++++++++++
+ 3 files changed, 413 insertions(+)
+ create mode 100644 vllm_gaudi/models/glm5next_kda.py
+ create mode 100644 vllm_gaudi/ops/hpu_kda_pytorch.py
+
+diff --git a/vllm_gaudi/models/__init__.py b/vllm_gaudi/models/__init__.py
+index afdeef1..fe7a2f5 100644
+--- a/vllm_gaudi/models/__init__.py
++++ b/vllm_gaudi/models/__init__.py
+@@ -73,6 +73,14 @@ def register_model():
+     import vllm_gaudi.models.gptoss_mxfp4  # noqa: F401
+     import vllm_gaudi.models.qwen3_next  # noqa: F401
+     import vllm_gaudi.models.qwen3_5  # noqa: F401
++    import vllm_gaudi.models.glm5next_kda  # noqa: F401
+     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
+     import vllm_gaudi.models.kimi_k25  # noqa: F401
+     import vllm_gaudi.models.gemma4_mm  # noqa: F401
++
++    # Qwen3.8-Flash-Next (qwen4_exp): HPU port (dense attention fallback for QSA,
++    # pure-torch hyper-connections, HPU-native PLE n-gram layer).
++    ModelRegistry.register_model("Qwen4ExpForCausalLM", "vllm_gaudi.models.qwen4_exp:HpuQwen4ExpForCausalLM")
++    ModelRegistry.register_model("Qwen4ExpForConditionalGeneration",
++                                 "vllm_gaudi.models.qwen4_exp:HpuQwen4ExpForConditionalGeneration")
++    ModelRegistry.register_model("Qwen4ExpMTP", "vllm_gaudi.models.qwen4_exp_mtp:HpuQwen4ExpMTP")
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+new file mode 100644
+index 0000000..cad623c
+--- /dev/null
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU Glm5NextLinearAttention: KDA via GDN kernels + bounded-sigmoid gate."""
++from __future__ import annotations
++
++import torch
++
++from vllm.forward_context import get_forward_context
++from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
++
++from vllm_gaudi.ops.causal_conv1d_pytorch import (
++    hpu_causal_conv1d_fn,
++    hpu_causal_conv1d_update,
++)
++from vllm_gaudi.ops.hpu_kda_pytorch import (
++    hpu_chunk_kda,
++    hpu_fused_recurrent_kda,
++    hpu_kda_gate,
++)
++from vllm_gaudi.ops.hpu_gdn_pytorch import _l2norm_last_dim  # noqa: F401
++
++
++@torch._dynamo.disable
++def _save_kda_state(passthrough, final_state, ssm_state, state_indices):
++    safe_si = torch.remainder(state_indices, ssm_state.shape[0]).long()
++    ssm_state.index_copy_(
++        0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype)
++    )
++    return passthrough
++
++
++def _rmsnorm_sigmoid_gate(x, gate, weight, eps=1e-5):
++    x_f = x.float()
++    var = x_f.pow(2).mean(dim=-1, keepdim=True)
++    y = x_f * torch.rsqrt(var + eps)
++    if weight is not None:
++        y = y * weight.float()
++    return (y * torch.sigmoid(gate.float())).to(x.dtype)
++
++
++class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
++    """Same weights as upstream KDA; HPU conv + KDA recurrent/chunk."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.cache_group_idx = None
++
++    def _resolve_state_indices(self, attn_metadata):
++        indices = getattr(attn_metadata, "load_indices_tensor", None)
++        if indices is None:
++            indices = getattr(attn_metadata, "non_spec_state_indices_tensor", None)
++        if indices is not None and indices.dim() > 1:
++            cg = self.cache_group_idx
++            assert cg is not None
++            indices = indices.index_select(0, cg.view(1)).squeeze(0)
++        return indices
++
++    def _extract_metadata(self, num_tokens):
++        attn_metadata = getattr(HPUGlm5NextLinearAttention, "_step_md", None)
++        if attn_metadata is None:
++            raw = get_forward_context().attn_metadata
++            if isinstance(raw, dict):
++                attn_metadata = raw.get(self.prefix)
++            else:
++                attn_metadata = raw
++        if attn_metadata is None:
++            return (False, None, None, None, None, None, 0, 0, 0, None)
++
++        is_prompt = bool(getattr(attn_metadata, "is_prompt", False)
++                         or getattr(attn_metadata, "num_prefills", 0) > 0)
++        state_indices = self._resolve_state_indices(attn_metadata)
++        conv_state, ssm_state = self.kv_cache[0], self.kv_cache[1]
++        query_start_loc = getattr(attn_metadata, "query_start_loc_p", None)
++        if query_start_loc is None:
++            query_start_loc = getattr(attn_metadata, "non_spec_query_start_loc", None)
++        has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
++        if has_initial_state is None:
++            has_initial_state = getattr(attn_metadata, "has_initial_state", None)
++
++        if not is_prompt:
++            num_decodes = (state_indices.numel() if state_indices is not None else num_tokens)
++        else:
++            num_decodes = 0
++        prefill_num_seqs = 0
++        prefill_seq_len = 0
++        initial_state = None
++        if is_prompt and state_indices is not None:
++            prefill_num_seqs = int(state_indices.numel())
++            prefill_seq_len = num_tokens // prefill_num_seqs if prefill_num_seqs else 0
++            initial_state = ssm_state[state_indices].contiguous()
++            if has_initial_state is not None:
++                mask = has_initial_state.bool().view(-1, 1, 1, 1)
++                initial_state = torch.where(mask, initial_state, torch.zeros_like(initial_state))
++        return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc,
++                has_initial_state, num_decodes, prefill_num_seqs, prefill_seq_len,
++                initial_state)
++
++    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
++        orig_shape = hidden_states.shape
++        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
++        num_tokens = hidden_states.size(0)
++
++        (is_prompt, conv_state, ssm_state, state_indices, query_start_loc,
++         has_initial_state, num_decodes, prefill_num_seqs, prefill_seq_len,
++         initial_state) = self._extract_metadata(num_tokens)
++
++        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
++        qkv, beta_raw, f_a, g_a = projected.split(
++            [
++                3 * self.local_projection_size,
++                self.local_num_heads,
++                self.head_dim,
++                self.head_dim,
++            ],
++            dim=-1,
++        )
++        g1 = self.f_b_proj(f_a)[0].reshape(-1, self.local_num_heads, self.head_dim)
++        g2 = self.g_b_proj(g_a)[0].reshape(-1, self.local_num_heads, self.head_dim)
++        g = hpu_kda_gate(
++            g1, self.A_log, self.dt_bias, self.kda_lower_bound,
++            self.local_num_heads, self.head_dim,
++        )
++        beta = torch.sigmoid(beta_raw.float()).to(hidden_states.dtype)
++
++        if self._merged_conv_weight is None:
++            def _w(m):
++                return m.weight.view(m.weight.size(0), m.weight.size(2))
++            self._merged_conv_weight = torch.cat(
++                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)], dim=0
++            ).contiguous()
++        conv_weights = self._merged_conv_weight
++        conv_bias = self.q_conv1d.bias
++
++        if conv_state is None:
++            # profile run
++            core = hidden_states.new_zeros(
++                num_tokens, self.local_num_heads, self.head_dim
++            )
++        elif is_prompt:
++            mixed = hpu_causal_conv1d_fn(
++                x=qkv.transpose(0, 1),
++                weight=conv_weights,
++                bias=conv_bias,
++                conv_states=conv_state,
++                query_start_loc=query_start_loc,
++                cache_indices=state_indices,
++                has_initial_state=has_initial_state,
++                activation="silu",
++                is_prompt=True,
++            ).transpose(0, 1)
++            q, k, v = mixed.split(self.local_projection_size, dim=-1)
++            q = q.reshape(1, -1, self.local_num_heads, self.head_dim)
++            k = k.reshape(1, -1, self.local_num_heads, self.head_dim)
++            v = v.reshape(1, -1, self.local_num_heads, self.head_dim)
++            g_b = g.unsqueeze(0)
++            beta_b = beta.unsqueeze(0)
++            core, final_state = hpu_chunk_kda(
++                q, k, v, g_b, beta_b,
++                initial_state=initial_state,
++                output_final_state=True,
++                use_qk_l2norm_in_kernel=True,
++                chunk_size=64,
++                prefill_num_seqs=prefill_num_seqs,
++                prefill_seq_len=prefill_seq_len,
++            )
++            core = _save_kda_state(core, final_state, ssm_state, state_indices)
++            core = core.reshape(-1, self.local_num_heads, self.head_dim)
++        else:
++            mixed = hpu_causal_conv1d_update(
++                x=qkv,
++                conv_state=conv_state,
++                weight=conv_weights,
++                bias=conv_bias,
++                activation="silu",
++                conv_state_indices=(
++                    state_indices[:num_decodes] if state_indices is not None else state_indices
++                ),
++            )
++            q, k, v = mixed.split(self.local_projection_size, dim=-1)
++            q = q.reshape(1, -1, self.local_num_heads, self.head_dim)
++            k = k.reshape(1, -1, self.local_num_heads, self.head_dim)
++            v = v.reshape(1, -1, self.local_num_heads, self.head_dim)
++            core, _ = hpu_fused_recurrent_kda(
++                q, k, v, g.unsqueeze(0), beta.unsqueeze(0),
++                initial_state=ssm_state,
++                inplace_final_state=True,
++                ssm_state_indices=state_indices,
++                use_qk_l2norm_in_kernel=True,
++            )
++            core = core.reshape(-1, self.local_num_heads, self.head_dim)
++
++        core = _rmsnorm_sigmoid_gate(core, g2, self.o_norm.weight)
++        out = self.o_proj(core.reshape(core.size(0), -1))[0]
++        return out.view(orig_shape)
++
++
++# Swap the NVIDIA class so Glm5NextDecoderLayer constructs the HPU path.
++import vllm.models.glm5next.nvidia.kda as _kda_mod  # noqa: E402
++import vllm.models.glm5next.nvidia.model as _model_mod  # noqa: E402
++
++_kda_mod.Glm5NextLinearAttention = HPUGlm5NextLinearAttention
++_model_mod.Glm5NextLinearAttention = HPUGlm5NextLinearAttention
+diff --git a/vllm_gaudi/ops/hpu_kda_pytorch.py b/vllm_gaudi/ops/hpu_kda_pytorch.py
+new file mode 100644
+index 0000000..0a0e95e
+--- /dev/null
++++ b/vllm_gaudi/ops/hpu_kda_pytorch.py
+@@ -0,0 +1,204 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HPU KDA kernels: bounded-sigmoid gate + per-channel gated delta rule.
++
++Extends the GDN path in hpu_gdn_pytorch.py. Differences vs GDN:
++- Gate is ``lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias))`` (diag).
++- Decay is per-channel: ``h[v, k] *= exp(g[k])`` (IS_KDA in FLA recurrent).
++"""
++from __future__ import annotations
++
++import torch
++
++from vllm_gaudi.ops.hpu_gdn_pytorch import _l2norm_last_dim
++
++_KDA_COMPUTE_DTYPE = torch.float32
++
++
++def hpu_kda_gate(
++    raw_g: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor | None,
++    lower_bound: float = -5.0,
++    num_heads: int | None = None,
++    head_dim: int | None = None,
++) -> torch.Tensor:
++    """KDA safe-gate. raw_g: [..., H, D] or [..., H*D]. Returns [..., H, D] F32."""
++    A = A_log.reshape(-1).to(torch.float32)
++    H = int(A.numel()) if num_heads is None else num_heads
++    D = head_dim
++    if raw_g.dim() >= 2 and raw_g.shape[-2] == H:
++        g_in = raw_g.to(torch.float32)
++        D = g_in.shape[-1]
++    else:
++        if D is None:
++            D = raw_g.shape[-1] // H
++        g_in = raw_g.to(torch.float32).reshape(*raw_g.shape[:-1], H, D)
++    if dt_bias is not None:
++        g_in = g_in + dt_bias.to(torch.float32).reshape(H, D)
++    a = torch.exp(A).view(*([1] * (g_in.dim() - 2)), H, 1)
++    return lower_bound * torch.sigmoid(a * g_in)
++
++
++def hpu_fused_recurrent_kda(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    initial_state: torch.Tensor | None = None,
++    inplace_final_state: bool = True,
++    ssm_state_indices: torch.Tensor | None = None,
++    use_qk_l2norm_in_kernel: bool = True,
++    scale: float | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """KDA recurrent. q/k/v: [B, T, H, D], g: [B, T, H, D], beta: [B, T, H].
++
++    Decode fast path: B=1, T=N seqs, one token each (or T=1).
++    Prefill: B=1, T=seq_len, one sequence (or batched via ssm_state_indices
++    of length 1). Multi-token multi-seq uses a dynamo-disabled time loop.
++    """
++    B, T, H, D = q.shape
++    if scale is None:
++        scale = D ** -0.5
++    device = q.device
++
++    # Decode: one token per sequence.
++    all_single = (B == 1 and ssm_state_indices is not None
++                  and ssm_state_indices.reshape(-1).numel() == T) or (T == 1)
++    if all_single and T > 0:
++        num_seqs = T if B == 1 else B
++        if initial_state is None:
++            final_state = torch.zeros((num_seqs, H, D, D), dtype=torch.float32, device=device)
++        else:
++            final_state = initial_state if inplace_final_state else initial_state.clone()
++        if ssm_state_indices is not None:
++            sidx = torch.remainder(ssm_state_indices.reshape(-1).long(), final_state.shape[0])
++        else:
++            sidx = torch.arange(num_seqs, dtype=torch.long, device=device)
++        h = final_state.index_select(0, sidx).to(_KDA_COMPUTE_DTYPE)
++        qf = q.reshape(-1, H, D).to(_KDA_COMPUTE_DTYPE)
++        kf = k.reshape(-1, H, D).to(_KDA_COMPUTE_DTYPE)
++        vf = v.reshape(-1, H, D).to(_KDA_COMPUTE_DTYPE)
++        gf = g.reshape(-1, H, D).to(torch.float32)
++        bf = beta.reshape(-1, H).to(_KDA_COMPUTE_DTYPE)
++        if use_qk_l2norm_in_kernel:
++            qf = _l2norm_last_dim(qf)
++            kf = _l2norm_last_dim(kf)
++        qf = qf * scale
++        h = h * torch.exp(gf).to(h.dtype).unsqueeze(-2)
++        proj = torch.sum(h * kf.unsqueeze(-2), dim=-1)
++        v_new = (vf - proj) * bf.unsqueeze(-1)
++        h = h + v_new.unsqueeze(-1) * kf.unsqueeze(-2)
++        out = torch.sum(h * qf.unsqueeze(-2), dim=-1)
++        final_state.index_copy_(0, sidx, h.to(final_state.dtype))
++        return out.unsqueeze(0).to(q.dtype) if B == 1 else out.view(B, T, H, D).to(q.dtype), final_state
++
++    return _kda_recurrent_time_loop(
++        q, k, v, g, beta, initial_state, inplace_final_state,
++        ssm_state_indices, use_qk_l2norm_in_kernel, scale,
++    )
++
++
++@torch._dynamo.disable
++def _kda_recurrent_time_loop(
++    q, k, v, g, beta, initial_state, inplace_final_state,
++    ssm_state_indices, use_qk_l2norm_in_kernel, scale,
++):
++    """Prefill / multi-token: time loop outside the compiled graph."""
++    B, T, H, D = q.shape
++    device = q.device
++    if ssm_state_indices is not None:
++        num_seqs = int(ssm_state_indices.reshape(-1).numel())
++    else:
++        num_seqs = B
++    if initial_state is None:
++        final_state = torch.zeros((num_seqs, H, D, D), dtype=torch.float32, device=device)
++    else:
++        final_state = initial_state if inplace_final_state else initial_state.clone()
++
++    qf = q.reshape(-1, H, D).to(torch.float32)
++    kf = k.reshape(-1, H, D).to(torch.float32)
++    vf = v.reshape(-1, H, D).to(torch.float32)
++    gf = g.reshape(-1, H, D).to(torch.float32)
++    bf = beta.reshape(-1, H).to(torch.float32)
++    if use_qk_l2norm_in_kernel:
++        qf = _l2norm_last_dim(qf)
++        kf = _l2norm_last_dim(kf)
++    qf = qf * scale
++
++    # One sequence of length T (B=1) or B sequences of length T.
++    if B == 1:
++        seq_len = T
++        nseq = 1 if ssm_state_indices is None or ssm_state_indices.numel() == 1 else num_seqs
++        if nseq == 1:
++            idx = (ssm_state_indices.reshape(-1).long()[0]
++                   if ssm_state_indices is not None else torch.tensor(0, device=device))
++            h = final_state[idx].to(torch.float32)
++            outs = []
++            for t in range(seq_len):
++                h = h * torch.exp(gf[t]).unsqueeze(-2)
++                proj = torch.sum(h * kf[t].unsqueeze(-2), dim=-1)
++                v_new = (vf[t] - proj) * bf[t].unsqueeze(-1)
++                h = h + v_new.unsqueeze(-1) * kf[t].unsqueeze(-2)
++                outs.append(torch.sum(h * qf[t].unsqueeze(-2), dim=-1))
++            final_state[idx] = h
++            out = torch.stack(outs, dim=0).unsqueeze(0)
++            return out.to(q.dtype), final_state
++
++    # B sequences, T tokens each, state slot = batch index.
++    outs = q.new_empty(B, T, H, D)
++    for b in range(B):
++        slot = int(ssm_state_indices.reshape(-1)[b]) if ssm_state_indices is not None else b
++        h = final_state[slot].to(torch.float32)
++        for t in range(T):
++            i = b * T + t
++            h = h * torch.exp(gf[i]).unsqueeze(-2)
++            proj = torch.sum(h * kf[i].unsqueeze(-2), dim=-1)
++            v_new = (vf[i] - proj) * bf[i].unsqueeze(-1)
++            h = h + v_new.unsqueeze(-1) * kf[i].unsqueeze(-2)
++            outs[b, t] = torch.sum(h * qf[i].unsqueeze(-2), dim=-1).to(q.dtype)
++        final_state[slot] = h
++    return outs, final_state
++
++
++def hpu_chunk_kda(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    initial_state: torch.Tensor | None = None,
++    output_final_state: bool = True,
++    use_qk_l2norm_in_kernel: bool = True,
++    chunk_size: int = 64,
++    prefill_num_seqs: int | None = None,
++    prefill_seq_len: int | None = None,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Prefill KDA. Static-shape buckets: reshape to [S, L, H, D] then recurrent.
++
++    Token loop is dynamo-disabled (graph_break, PLE lesson). Chunk_size is
++    accepted for API parity with GDN; the exact recurrent is the Gate-2 oracle.
++    """
++    B, T, H, D = q.shape
++    if prefill_num_seqs is not None and prefill_seq_len is not None and prefill_num_seqs > 0:
++        S, L = prefill_num_seqs, prefill_seq_len
++        q = q.reshape(S, L, H, D)
++        k = k.reshape(S, L, H, D)
++        v = v.reshape(S, L, H, D)
++        g = g.reshape(S, L, H, D)
++        beta = beta.reshape(S, L, H)
++        out, st = hpu_fused_recurrent_kda(
++            q, k, v, g, beta,
++            initial_state=initial_state,
++            inplace_final_state=True,
++            ssm_state_indices=torch.arange(S, device=q.device),
++            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
++        )
++        return out.reshape(B, T, H, D), st if output_final_state else None
++    out, st = hpu_fused_recurrent_kda(
++        q, k, v, g, beta,
++        initial_state=initial_state,
++        inplace_final_state=True,
++        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
++    )
++    return out, st if output_final_state else None
+-- 
+2.43.0
+

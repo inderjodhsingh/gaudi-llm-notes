@@ -1,0 +1,35 @@
+From 972767f9d020deac23c5f7b5b57d76a526d6a474 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:16:01 +0000
+Subject: [PATCH] HPU MLA wrapper accepts fuse_qkv_rmsnorm (glm5next / #1782)
+
+---
+ vllm_gaudi/attention/oot_mla.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index 2e9b924..788df63 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -278,6 +278,10 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
+         # accept-and-ignore the kwarg to keep the constructor signature in sync
+         # with the base MultiHeadLatentAttentionWrapper / deepseek_v2 call site.
+         allow_short_prefill_indexer_scoring_skip: bool = False,
++        # GLM-5.3-Flash (vllm#53906 / #1782) passes fuse_qkv_rmsnorm=True.
++        # v0.29.0 HPU wrapper was cut before that kwarg; accept it so construct
++        # succeeds. Fusion itself is Phase 3; load only needs the signature.
++        fuse_qkv_rmsnorm: bool = False,
+     ) -> None:
+         # Skip MultiHeadLatentAttentionWrapper.__init__() because it creates
+         # MLAAttention → FlashAttnPrefillBackend which crashes on HPU.
+@@ -313,6 +317,7 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
+         # DSA sparse attention is not implemented on HPU: sparse layers run as
+         # dense MLA and the indexer must never be invoked (its kernels and the
+         # DeepseekV32IndexerBackend are CUDA-only).
++        self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+         self.skip_topk = skip_topk or self.is_sparse
+         # vllm#45964 (DCP query replication) added `self.dcp_q_replicate`, which
+         # the base MultiHeadLatentAttentionWrapper.forward (inherited here, since
+-- 
+2.43.0
+

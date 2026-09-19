@@ -1,0 +1,143 @@
+From a4966a61ede49ef4636e184ae934bce5d79cee1f Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 04:39:12 +0000
+Subject: [PATCH 1/2] HPU GLM-5.3 KDA: build merged conv weight eagerly after
+ load (warmup compile-only mode poisoned the lazy cache)
+
+After warmup every output was garbage (or NaN): the layer cached
+_merged_conv_weight on its first forward, which ran under
+PT_COMPILE_ONLY_MODE where the torch.cat is compiled but never executed;
+the uninitialized result (absmax 6e-4 vs 1.2e-2 real) was then used by
+every real prefill/decode. Materialize it in apply_model_specific_patches
+before warmup, like _init_mamba_split_weights.
+---
+ vllm_gaudi/models/glm5next_kda.py        | 32 ++++++++++++++++++++----
+ vllm_gaudi/v1/worker/hpu_model_runner.py |  5 ++++
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index 617a130..20bbd4f 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -44,6 +44,28 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         super().__init__(*args, **kwargs)
+         self.cache_group_idx = None
+ 
++    def _build_merged_conv_weight(self):
++        def _w(m):
++            return m.weight.view(m.weight.size(0), m.weight.size(2))
++        self._merged_conv_weight = torch.cat(
++            [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)], dim=0
++        ).contiguous()
++
++
++def init_merged_conv_weights(model: torch.nn.Module) -> int:
++    """Eagerly build the merged q|k|v conv weight of every HPU KDA layer.
++
++    MUST run after weight loading and before warmup: under PT_COMPILE_ONLY_MODE
++    a lazily computed tensor is never materialized, and caching it poisoned every
++    later forward (GLM-5.3 post-warmup garbage/NaN)."""
++    n = 0
++    with torch.no_grad():
++        for m in model.modules():
++            if isinstance(m, HPUGlm5NextLinearAttention):
++                m._build_merged_conv_weight()
++                n += 1
++    return n
++
+     @torch._dynamo.disable
+     def _resolve_state_indices(self, attn_metadata):
+         """Pick this layer's 1-D state indices from hybrid [num_groups, batch].
+@@ -158,11 +180,11 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+             beta = torch.where(token_mask_b.view(-1, 1), beta, torch.zeros_like(beta))
+ 
+         if self._merged_conv_weight is None:
+-            def _w(m):
+-                return m.weight.view(m.weight.size(0), m.weight.size(2))
+-            self._merged_conv_weight = torch.cat(
+-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)], dim=0
+-            ).contiguous()
++            # Normally built eagerly by init_merged_conv_weights() after weight
++            # loading. Building it lazily here is unsafe under warmup's
++            # PT_COMPILE_ONLY_MODE (the cat is compiled but never executed and the
++            # garbage result gets cached -> post-warmup NaN/garbage output).
++            self._build_merged_conv_weight()
+         conv_weights = self._merged_conv_weight
+         conv_bias = self.q_conv1d.bias
+ 
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 44a1c27..251465b 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -1062,6 +1062,11 @@ def apply_model_specific_patches(model_runner):
+     is_gemma4 = model_type in ("gemma4", )
+ 
+     model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
++    if model_type in ("glm5_next", "glm5_next_text"):
++        # Materialize derived KDA tensors before warmup (compile-only mode never
++        # executes lazily built tensors; see glm5next_kda.init_merged_conv_weights).
++        from vllm_gaudi.models.glm5next_kda import init_merged_conv_weights
++        logger.info("GLM-5.3: merged conv weights built for %d KDA layers", init_merged_conv_weights(model_runner.model))
+     if is_llama4:
+         apply_hpu_llama4_post_load_patches(model_runner.model)
+     if is_qwen_moe:
+-- 
+2.43.0
+
+
+From 7205c822f89b591d3010da4f453d88a159e5abb0 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 05:00:02 +0000
+Subject: [PATCH 2/2] HPU GLM-5.3 KDA: move init_merged_conv_weights after the
+ class (patch 38 had split the class body)
+
+---
+ vllm_gaudi/models/glm5next_kda.py | 28 +++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index 20bbd4f..9920848 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -52,19 +52,6 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         ).contiguous()
+ 
+ 
+-def init_merged_conv_weights(model: torch.nn.Module) -> int:
+-    """Eagerly build the merged q|k|v conv weight of every HPU KDA layer.
+-
+-    MUST run after weight loading and before warmup: under PT_COMPILE_ONLY_MODE
+-    a lazily computed tensor is never materialized, and caching it poisoned every
+-    later forward (GLM-5.3 post-warmup garbage/NaN)."""
+-    n = 0
+-    with torch.no_grad():
+-        for m in model.modules():
+-            if isinstance(m, HPUGlm5NextLinearAttention):
+-                m._build_merged_conv_weight()
+-                n += 1
+-    return n
+ 
+     @torch._dynamo.disable
+     def _resolve_state_indices(self, attn_metadata):
+@@ -278,3 +265,18 @@ import vllm.models.glm5next.nvidia.model as _model_mod  # noqa: E402
+ 
+ _kda_mod.Glm5NextLinearAttention = HPUGlm5NextLinearAttention
+ _model_mod.Glm5NextLinearAttention = HPUGlm5NextLinearAttention
++
++
++def init_merged_conv_weights(model: torch.nn.Module) -> int:
++    """Eagerly build the merged q|k|v conv weight of every HPU KDA layer.
++
++    MUST run after weight loading and before warmup: under PT_COMPILE_ONLY_MODE
++    a lazily computed tensor is never materialized, and caching it poisoned every
++    later forward (GLM-5.3 post-warmup garbage/NaN)."""
++    n = 0
++    with torch.no_grad():
++        for m in model.modules():
++            if isinstance(m, HPUGlm5NextLinearAttention):
++                m._build_merged_conv_weight()
++                n += 1
++    return n
+-- 
+2.43.0
+

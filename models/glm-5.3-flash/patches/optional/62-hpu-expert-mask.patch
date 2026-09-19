@@ -1,0 +1,506 @@
+From 4563d729de8b5453e3978146070b67e0385e5ffe Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 13:25:36 +0000
+Subject: [PATCH] patch 62: opt-in runtime expert mask (GLM53_EXPERT_MASK) for
+ grouped-top-k routing on HPU
+
+Per-layer [num_experts] additive mask buffer (0 kept / finfo.min dropped) installed after weight load by the FP8,
+compressed-tensors and unquantized MoE methods and passed into vLLM's cpu_moe.select_experts (patch 63) so dropped
+experts can never be selected; weights stay the survivors' unbiased sigmoid scores, renormalised. Zero effect when
+unset. Fails loud if a MoE method never installed the attribute. CPU unit test in tests/unit_tests/ops.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tests/unit_tests/ops/test_expert_mask_cpu.py | 223 +++++++++++++++++++
+ vllm_gaudi/ops/hpu_compressed_tensors.py     |   3 +
+ vllm_gaudi/ops/hpu_expert_mask.py            | 157 +++++++++++++
+ vllm_gaudi/ops/hpu_fp8.py                    |   4 +
+ vllm_gaudi/ops/hpu_fused_moe.py              |  14 ++
+ 5 files changed, 401 insertions(+)
+ create mode 100644 tests/unit_tests/ops/test_expert_mask_cpu.py
+ create mode 100644 vllm_gaudi/ops/hpu_expert_mask.py
+
+diff --git a/tests/unit_tests/ops/test_expert_mask_cpu.py b/tests/unit_tests/ops/test_expert_mask_cpu.py
+new file mode 100644
+index 0000000..9a4835a
+--- /dev/null
++++ b/tests/unit_tests/ops/test_expert_mask_cpu.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU unit test for the GLM53_EXPERT_MASK runtime expert drop.
++
++Needs only torch + the Python stdlib + the two modules under test:
++  * vllm_gaudi/ops/hpu_expert_mask.py (loaded by file path, so importing the vllm_gaudi package
++    and its HPU platform plugin is not required);
++  * vllm.model_executor.layers.fused_moe.experts.cpu_moe.grouped_topk / select_experts, the routing
++    functions the HPU monolithic MoE path really calls (hpu_fused_moe.select_experts_from_routed).
++
++Run:  python3 tests/unit_tests/ops/test_expert_mask_cpu.py      (or via pytest)
++"""
++from __future__ import annotations
++
++import contextlib
++import importlib.util
++import io
++import json
++import os
++import pathlib
++import tempfile
++
++import torch
++
++_HERE = pathlib.Path(__file__).resolve()
++_MASK_MOD_PATH = _HERE.parents[3] / "vllm_gaudi" / "ops" / "hpu_expert_mask.py"
++
++
++def _load_mask_module():
++    if _MASK_MOD_PATH.exists():
++        spec = importlib.util.spec_from_file_location("hpu_expert_mask_under_test", _MASK_MOD_PATH)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        return mod
++    from vllm_gaudi.ops import hpu_expert_mask  # fallback: installed package
++    return hpu_expert_mask
++
++
++em = _load_mask_module()
++from vllm.model_executor.layers.fused_moe.experts.cpu_moe import grouped_topk, select_experts  # noqa: E402
++
++E, K, RSF = 288, 8, 2.5  # GLM-5.3-Flash: 288 routed experts, top-8, routed_scaling_factor 2.5
++
++
++def _inputs(seed=0, tokens=64, n_dropped=40, bias_boost=6.0):
++    g = torch.Generator().manual_seed(seed)
++    hidden = torch.randn(tokens, 16, generator=g)
++    logits = torch.randn(tokens, E, generator=g) * 2.0
++    bias = torch.randn(E, generator=g) * 0.1
++    dropped = torch.randperm(E, generator=g)[:n_dropped].sort().values
++    # Give the dropped experts a large POSITIVE correction bias: without the mask they must win the
++    # top-k, which proves the mask acts after the bias is added.
++    bias[dropped] += bias_boost
++    return hidden, logits, bias, dropped
++
++
++def _run(hidden, logits, bias, mask, renormalize=True, num_expert_group=1, topk_group=1):
++    return grouped_topk(hidden, logits, K, renormalize, num_expert_group=num_expert_group,
++                        topk_group=topk_group, scoring_func="sigmoid", routed_scaling_factor=RSF,
++                        e_score_correction_bias=bias, expert_mask=mask)
++
++
++def test_masked_experts_never_selected_and_weights_sum_to_scale():
++    hidden, logits, bias, dropped = _inputs()
++    mask = em.build_expert_mask(dropped.tolist(), E, K)
++    assert mask.shape == (E,) and mask.dtype == torch.float32
++    assert (mask[dropped] == torch.finfo(torch.float32).min).all() and (mask == 0).sum() == E - len(dropped)
++
++    # Sanity: the positive bias really does pull dropped experts into the unmasked top-k.
++    _, ids_unmasked = _run(hidden, logits, bias, None)
++    assert torch.isin(ids_unmasked, dropped).any(), "test setup: bias boost should select dropped experts"
++
++    w, ids = _run(hidden, logits, bias, mask)
++    assert ids.shape == (hidden.shape[0], K)
++    assert not torch.isin(ids, dropped).any(), "a masked expert was selected"
++    assert ids.unique(dim=-1).shape == ids.shape  # K distinct experts per token
++    assert torch.allclose(w.sum(-1), torch.full((hidden.shape[0], ), RSF)), "weights must sum to routed_scaling_factor"
++
++    # Exactness: masked routing == plain routing restricted to the kept experts (same scores, bias,
++    # renormalisation), with ids mapped back to global ids. Compare as sets per token (topk is unsorted).
++    kept = torch.tensor(sorted(set(range(E)) - set(dropped.tolist())))
++    w_ref, ids_ref = grouped_topk(hidden, logits[:, kept], K, True, num_expert_group=1, topk_group=1,
++                                  scoring_func="sigmoid", routed_scaling_factor=RSF,
++                                  e_score_correction_bias=bias[kept])
++    ids_ref = kept[ids_ref.long()]
++    order, order_ref = ids.argsort(-1), ids_ref.argsort(-1)
++    assert torch.equal(ids.gather(1, order), ids_ref.gather(1, order_ref))
++    assert torch.allclose(w.gather(1, order), w_ref.gather(1, order_ref), atol=1e-6)
++
++
++def test_no_renormalize_weights_are_unbiased_scores_times_scale():
++    hidden, logits, bias, dropped = _inputs(seed=1)
++    mask = em.build_expert_mask(dropped.tolist(), E, K)
++    w, ids = _run(hidden, logits, bias, mask, renormalize=False)
++    assert not torch.isin(ids, dropped).any()
++    expect = logits.sigmoid().gather(1, ids.long()) * RSF
++    assert torch.allclose(w, expect, atol=1e-6)
++
++
++def test_mask_none_and_all_zero_mask_change_nothing():
++    hidden, logits, bias, _ = _inputs(seed=2, n_dropped=0)
++    w0, i0 = _run(hidden, logits, bias, None)
++    w1, i1 = _run(hidden, logits, bias, torch.zeros(E))
++    assert torch.equal(i0, i1) and torch.equal(w0, w1)
++    # kwarg omitted entirely (what the plugin passes for an unmasked layer) == None
++    w2, i2 = grouped_topk(hidden, logits, K, True, num_expert_group=1, topk_group=1, scoring_func="sigmoid",
++                          routed_scaling_factor=RSF, e_score_correction_bias=bias)
++    assert torch.equal(i0, i2) and torch.equal(w0, w2)
++
++
++def test_select_experts_passthrough_and_guard():
++    hidden, logits, bias, dropped = _inputs(seed=3)
++    mask = em.build_expert_mask(dropped.tolist(), E, K)
++    w, ids = select_experts(hidden_states=hidden, router_logits=logits, top_k=K, use_grouped_topk=True,
++                            renormalize=True, topk_group=1, num_expert_group=1, custom_routing_function=None,
++                            scoring_func="sigmoid", routed_scaling_factor=RSF, e_score_correction_bias=bias,
++                            expert_mask=mask)
++    assert not torch.isin(ids, dropped).any()
++    assert torch.allclose(w.sum(-1), torch.full((hidden.shape[0], ), RSF))
++    try:
++        select_experts(hidden_states=hidden, router_logits=logits, top_k=K, use_grouped_topk=False,
++                       renormalize=True, expert_mask=mask)
++    except NotImplementedError:
++        pass
++    else:
++        raise AssertionError("expert_mask without grouped topk must be rejected")
++
++
++def test_grouped_variant_with_groups():
++    # Not GLM-5.3's config (n_group=1) but proves the mask composes with real group selection.
++    hidden, logits, bias, dropped = _inputs(seed=4, n_dropped=60)
++    mask = em.build_expert_mask(dropped.tolist(), E, K, num_expert_group=8, topk_group=4)
++    w, ids = _run(hidden, logits, bias, mask, num_expert_group=8, topk_group=4)
++    assert not torch.isin(ids, dropped).any()
++    assert torch.allclose(w.sum(-1), torch.full((hidden.shape[0], ), RSF))
++
++
++def test_build_expert_mask_validation():
++    for bad in ([E], [-1]):
++        try:
++            em.build_expert_mask(bad, E, K)
++        except ValueError:
++            pass
++        else:
++            raise AssertionError(f"out-of-range id {bad} accepted")
++    try:
++        em.build_expert_mask(list(range(E - K + 1)), E, K)  # only K-1 kept
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("mask leaving fewer than top_k experts accepted")
++    try:
++        em.build_expert_mask(list(range(36)), E, K, num_expert_group=8, topk_group=4)  # group 0 fully dropped
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("fully dropped group accepted")
++    assert em.layer_index_from_name("model.layers.17.mlp.experts") == 17
++    assert em.layer_index_from_name("model.layers.45.mlp.experts") == 45  # MTP block
++    assert em.layer_index_from_name("lm_head") is None
++
++
++class _FakeMoEConfig:
++    ep_rank = 3
++
++
++class _FakeRoutedExperts(torch.nn.Module):
++    """Mimics vllm RoutedExperts attributes read by install_expert_mask."""
++
++    def __init__(self, layer_name):
++        super().__init__()
++        self.layer_name = layer_name
++        self.global_num_experts = E
++        self.top_k = K
++        self.num_expert_group = 1
++        self.topk_group = 1
++        self.moe_config = _FakeMoEConfig()
++        self.e_score_correction_bias = torch.nn.Parameter(torch.zeros(E), requires_grad=False)
++
++
++def test_install_from_json_env_prints_once_and_unset_is_noop():
++    with tempfile.TemporaryDirectory() as d:
++        path = os.path.join(d, "mask.json")
++        with open(path, "w") as f:
++            json.dump({"17": [5, 200, 287, 5], "20": []}, f)
++        old = os.environ.get(em.EXPERT_MASK_ENV)
++        try:
++            os.environ[em.EXPERT_MASK_ENV] = path
++            err = io.StringIO()
++            l17, l20, l21 = (_FakeRoutedExperts(f"model.layers.{i}.mlp.experts") for i in (17, 20, 21))
++            with contextlib.redirect_stderr(err):
++                m17 = em.install_expert_mask(l17)
++                assert em.install_expert_mask(l20) is None
++                assert em.install_expert_mask(l21) is None
++            assert "[EXPERT-MASK] layer 17: dropped 3 experts" in err.getvalue()
++            assert err.getvalue().count("[EXPERT-MASK]") == 1  # only the non-empty layer prints
++            assert m17 is getattr(l17, em.EXPERT_MASK_ATTR)
++            assert em.EXPERT_MASK_ATTR in dict(l17.named_buffers()), "mask must be a registered buffer"
++            assert em.EXPERT_MASK_ATTR not in l17.state_dict(), "buffer must be non-persistent"
++            assert getattr(l20, em.EXPERT_MASK_ATTR) is None and getattr(l21, em.EXPERT_MASK_ATTR) is None
++            assert (m17[[5, 200, 287]] == torch.finfo(torch.float32).min).all() and (m17 == 0).sum() == E - 3
++            # re-install (weight reload) must not raise on the existing buffer
++            with contextlib.redirect_stderr(io.StringIO()):
++                em.install_expert_mask(l17)
++            # unset env: attribute None, nothing printed
++            del os.environ[em.EXPERT_MASK_ENV]
++            err = io.StringIO()
++            with contextlib.redirect_stderr(err):
++                assert em.install_expert_mask(l17) is None
++            assert getattr(l17, em.EXPERT_MASK_ATTR) is None and err.getvalue() == ""
++        finally:
++            if old is not None:
++                os.environ[em.EXPERT_MASK_ENV] = old
++            else:
++                os.environ.pop(em.EXPERT_MASK_ENV, None)
++
++
++if __name__ == "__main__":
++    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
++    for name, fn in tests:
++        fn()
++        print(f"PASS {name}")
++    print(f"{len(tests)} tests passed")
+diff --git a/vllm_gaudi/ops/hpu_compressed_tensors.py b/vllm_gaudi/ops/hpu_compressed_tensors.py
+index 36352aa..c87913f 100644
+--- a/vllm_gaudi/ops/hpu_compressed_tensors.py
++++ b/vllm_gaudi/ops/hpu_compressed_tensors.py
+@@ -59,6 +59,7 @@ from vllm_gaudi.ops.hpu_fused_moe import (
+     _normalize_moe_activation,
+     select_experts_from_routed,
+ )
++from vllm_gaudi.ops.hpu_expert_mask import install_expert_mask
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_tensor
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizeMethodBase, )
+@@ -505,6 +506,8 @@ class HPUCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+             layer = hpu_ops.fp8_block_moe_prepare_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+         else:
+             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
++        # Opt-in GLM53_EXPERT_MASK: see hpu_fp8.HPUFp8MoEMethod.process_weights_after_loading.
++        install_expert_mask(layer)
+         return
+ 
+     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
+diff --git a/vllm_gaudi/ops/hpu_expert_mask.py b/vllm_gaudi/ops/hpu_expert_mask.py
+new file mode 100644
+index 0000000..db15398
+--- /dev/null
++++ b/vllm_gaudi/ops/hpu_expert_mask.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in runtime expert mask for grouped-top-k MoE routing (GLM53_EXPERT_MASK).
++
++``GLM53_EXPERT_MASK=<path.json>`` points at ``{"<decoder layer idx>": [dropped GLOBAL expert ids], ...}``.
++For every MoE layer named in the file a non-persistent ``[num_experts]`` float32 buffer
++``layer.glm53_expert_mask`` is registered at load time (``install_expert_mask`` is called from the HPU MoE
++methods' ``process_weights_after_loading``): 0.0 for kept experts, ``finfo.min`` for dropped ones. The
++monolithic HPU routing path (``hpu_fused_moe.select_experts_from_routed`` -> vLLM
++``experts.cpu_moe.select_experts`` -> ``grouped_topk``) adds it to the selection scores AFTER the
++``e_score_correction_bias`` and BEFORE the top-k, so a dropped expert can never be selected, while the
++routing weights are still the unbiased sigmoid scores of the survivors, renormalised and scaled as before.
++
++Design constraints honoured here:
++* zero effect when the env var is unset: the attribute is ``None`` and no op is added to the graph;
++* static shapes: the mask is a fixed ``[num_experts]`` tensor built once on the layer's device, so the
++  compiled decoder-layer region gets one extra constant-shaped graph input and never recompiles on a
++  batch-shape change;
++* every rank builds the identical mask from the same file (routing is replicated across EP ranks), so the
++  expert outputs all-reduced over the EP group stay consistent.
++"""
++from __future__ import annotations
++
++import functools
++import json
++import math
++import os
++import re
++import sys
++
++import torch
++
++EXPERT_MASK_ENV = "GLM53_EXPERT_MASK"
++EXPERT_MASK_ATTR = "glm53_expert_mask"
++
++_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
++
++
++@functools.lru_cache(maxsize=8)
++def load_expert_mask_spec(path: str) -> dict[int, tuple[int, ...]]:
++    """Parse the mask file into ``{layer_idx: sorted unique dropped global ids}``.
++
++    Cached per path so the 40+ MoE layers of a model read the file once per process. Malformed input
++    raises ``ValueError`` at load time (fail loud, never silently route to a partially masked model).
++    """
++    with open(path) as f:
++        raw = json.load(f)
++    if not isinstance(raw, dict):
++        raise ValueError(f"{EXPERT_MASK_ENV}: {path} must hold a JSON object {{layer_idx: [expert ids]}}")
++    spec: dict[int, tuple[int, ...]] = {}
++    for key, ids in raw.items():
++        try:
++            layer_idx = int(key)
++        except (TypeError, ValueError) as e:
++            raise ValueError(f"{EXPERT_MASK_ENV}: layer key {key!r} is not an integer") from e
++        if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
++            raise ValueError(f"{EXPERT_MASK_ENV}: layer {layer_idx}: expected a list of integer expert ids")
++        spec[layer_idx] = tuple(sorted(set(ids)))
++    return spec
++
++
++def layer_index_from_name(layer_name: str | None) -> int | None:
++    """``model.layers.17.mlp.experts`` -> 17 (same convention as the patch-61 routing histogram)."""
++    m = _LAYER_IDX_RE.search(layer_name or "")
++    return int(m.group(1)) if m else None
++
++
++def build_expert_mask(
++    dropped: tuple[int, ...] | list[int],
++    num_experts: int,
++    top_k: int,
++    num_expert_group: int = 1,
++    topk_group: int = 1,
++    dtype: torch.dtype = torch.float32,
++) -> torch.Tensor:
++    """Return the additive ``[num_experts]`` mask (0 kept / finfo.min dropped) after validating it.
++
++    Validation guarantees the top-k can always be filled from kept experts: at least ``top_k`` kept overall
++    and, when expert groups are used, at least ``ceil(top_k / topk_group)`` kept in every group (a
++    sufficient condition for any choice of ``topk_group`` groups). Group selection itself still runs on
++    the masked scores, so a fully dropped group can never be picked over a group with survivors.
++    """
++    dropped = tuple(sorted(set(int(i) for i in dropped)))
++    if any(i < 0 or i >= num_experts for i in dropped):
++        raise ValueError(f"expert mask: ids must lie in [0, {num_experts}), got {dropped}")
++    kept = num_experts - len(dropped)
++    if kept < top_k:
++        raise ValueError(f"expert mask: only {kept} of {num_experts} experts kept but top_k={top_k}")
++    num_expert_group = max(int(num_expert_group or 1), 1)
++    topk_group = max(int(topk_group or 1), 1)
++    if num_expert_group > 1:
++        if num_experts % num_expert_group:
++            raise ValueError(f"expert mask: {num_experts} experts not divisible by {num_expert_group} groups")
++        per_group = num_experts // num_expert_group
++        need = math.ceil(top_k / topk_group)
++        for g in range(num_expert_group):
++            lo, hi = g * per_group, (g + 1) * per_group
++            kept_g = per_group - sum(1 for i in dropped if lo <= i < hi)
++            if kept_g < need:
++                raise ValueError(f"expert mask: group {g} keeps {kept_g} experts, needs >= {need} "
++                                 f"(top_k={top_k}, topk_group={topk_group})")
++    mask = torch.zeros(num_experts, dtype=dtype)
++    if dropped:
++        mask[list(dropped)] = torch.finfo(dtype).min
++    return mask
++
++
++def _layer_device(layer: torch.nn.Module) -> torch.device:
++    for t in (getattr(layer, "e_score_correction_bias", None), getattr(layer, "w13_weight", None)):
++        if isinstance(t, torch.Tensor):
++            return t.device
++    try:
++        return next(layer.parameters()).device
++    except StopIteration:
++        return torch.device("cpu")
++
++
++def install_expert_mask(layer: torch.nn.Module) -> torch.Tensor | None:
++    """Attach ``layer.glm53_expert_mask`` (buffer, or ``None`` when unset/empty) and print one line.
++
++    Call once per MoE layer after its weights are loaded (before warmup/compile). Returns the mask.
++    """
++    # A previous install (weight reload) may have left a buffer or a plain attribute; clear both so
++    # register_buffer never hits "attribute already exists".
++    layer.__dict__.pop(EXPERT_MASK_ATTR, None)
++    layer._buffers.pop(EXPERT_MASK_ATTR, None)
++
++    path = os.environ.get(EXPERT_MASK_ENV)
++    if not path:
++        layer.register_buffer(EXPERT_MASK_ATTR, None, persistent=False)
++        return None
++
++    spec = load_expert_mask_spec(path)
++    layer_idx = layer_index_from_name(getattr(layer, "layer_name", None))
++    dropped = spec.get(layer_idx) if layer_idx is not None else None
++    if not dropped:
++        layer.register_buffer(EXPERT_MASK_ATTR, None, persistent=False)
++        return None
++
++    num_experts = int(layer.global_num_experts)
++    mask = build_expert_mask(
++        dropped,
++        num_experts,
++        int(layer.top_k),
++        int(getattr(layer, "num_expert_group", 1) or 1),
++        int(getattr(layer, "topk_group", 1) or 1),
++    )
++    mask = mask.to(_layer_device(layer))
++    layer.register_buffer(EXPERT_MASK_ATTR, mask, persistent=False)
++
++    moe_config = getattr(layer, "moe_config", None)
++    rank = getattr(moe_config, "ep_rank", 0) if moe_config is not None else 0
++    # print, not logger: logger.info from these modules does not reach the serve log.
++    print(f"[EXPERT-MASK] layer {layer_idx}: dropped {len(dropped)} experts "
++          f"(kept {num_experts - len(dropped)}/{num_experts}, rank {rank}, {path})",
++          file=sys.stderr, flush=True)
++    return mask
+diff --git a/vllm_gaudi/ops/hpu_fp8.py b/vllm_gaudi/ops/hpu_fp8.py
+index 6ea0d04..464f6ec 100644
+--- a/vllm_gaudi/ops/hpu_fp8.py
++++ b/vllm_gaudi/ops/hpu_fp8.py
+@@ -15,6 +15,7 @@ import vllm_gaudi.extension.ops as hpu_ops
+ from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
+ from vllm_gaudi.extension.runtime import get_config
+ from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
++from vllm_gaudi.ops.hpu_expert_mask import install_expert_mask
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
+ 
+ from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
+@@ -320,6 +321,9 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+                                      "activation scales are None.")
+                 layer.w13_input_scale = torch.nn.Parameter(layer.w13_input_scale.max(), requires_grad=False)
+             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
++        # Opt-in GLM53_EXPERT_MASK: per-layer routing mask buffer, built once here (after load, before
++        # warmup/compile) and consumed by select_experts_from_routed in apply_monolithic.
++        install_expert_mask(layer)
+ 
+     def apply_monolithic(
+         self,
+diff --git a/vllm_gaudi/ops/hpu_fused_moe.py b/vllm_gaudi/ops/hpu_fused_moe.py
+index 868065e..3528c90 100644
+--- a/vllm_gaudi/ops/hpu_fused_moe.py
++++ b/vllm_gaudi/ops/hpu_fused_moe.py
+@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+     ZeroExpertRouter, )
+ import vllm_gaudi.envs as gaudi_envs
+ from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
++from vllm_gaudi.ops.hpu_expert_mask import EXPERT_MASK_ATTR, EXPERT_MASK_ENV, install_expert_mask
+ from vllm_gaudi.extension.runtime import get_config
+ from vllm_gaudi.utils import has_quant_config
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
+@@ -368,6 +369,17 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
+         raise RuntimeError(f"Router logits have {router_logits.size(-1)} columns but the layer routes to "
+                            f"{num_experts} experts; the MoE gate was not applied to the hidden states.")
+ 
++    # Opt-in runtime expert drop (GLM53_EXPERT_MASK): a per-layer [num_experts] additive mask buffer
++    # installed by install_expert_mask() at load. Passed only when present, so an unmasked layer (or a
++    # vLLM without the expert_mask kwarg) runs the exact original call and the traced graph is unchanged.
++    if EXPERT_MASK_ENV in os.environ and not hasattr(layer, EXPERT_MASK_ATTR):
++        # install_expert_mask always registers the attribute (None when the layer is unmasked); an ABSENT
++        # attribute means the MoE method in use never installed it, and the model would silently route unmasked.
++        raise RuntimeError(f"{EXPERT_MASK_ENV} is set but {type(layer).__name__} {getattr(layer, 'layer_name', '?')} "
++                           "never had install_expert_mask() applied (MoE method not wired for the mask)")
++    expert_mask = getattr(layer, EXPERT_MASK_ATTR, None)
++    mask_kwargs = {"expert_mask": expert_mask} if expert_mask is not None else {}
++
+     return select_experts(
+         hidden_states=hidden_states,
+         router_logits=router_logits,
+@@ -380,6 +392,7 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
+         scoring_func=layer.scoring_func,
+         routed_scaling_factor=layer.routed_scaling_factor,
+         e_score_correction_bias=layer.e_score_correction_bias,
++        **mask_kwargs,
+     )
+ 
+ 
+@@ -457,6 +470,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         # Build cache once AFTER weights/bias are set (BF16 + unquantized only)
+         if cache_weight_lists and hasattr(layer.moe_op, "_cache_weight_lists"):
+             layer.moe_op._cache_weight_lists()
++        install_expert_mask(layer)
+ 
+     def apply_monolithic(
+         self,
+-- 
+2.43.0
+

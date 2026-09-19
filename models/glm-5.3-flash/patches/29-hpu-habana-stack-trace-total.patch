@@ -1,0 +1,59 @@
+From a327c52226e267a38eebc98cc496c9acafcdcf60 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 19:23:02 +0000
+Subject: [PATCH] HPU: make Habana _get_stack_trace total (torch.compile
+ crashed on None parse)
+
+hpu_backend raised AttributeError 'NoneType'.file inside
+_fx_to_jit_lowering._get_stack_trace on GLM-5.3 decoder layer graphs
+(SW 1.24.1 + torch 2.11). Debug-only info; swallow and return None.
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 32 ++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 52bab16..d3ba9ec 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -133,6 +133,38 @@ from vllm.model_executor.models.bert import _encode_token_type_ids
+ logger = init_logger()
+ 
+ 
++def _patch_habana_fx_stack_trace() -> None:
++    """Habana SW 1.24.1 + torch 2.11: ``_fx_to_jit_lowering._get_stack_trace`` calls
++    ``_parse_stack_trace`` which can return None (unparseable node stack_trace),
++    then dereferences ``.file`` -> AttributeError inside hpu_backend and the
++    whole compile fails. Stack traces are debug-only; make the helper total."""
++    try:
++        from habana_frameworks.torch.dynamo import _fx_to_jit_lowering as _low
++    except Exception:
++        return
++    cls = getattr(_low, "FxToJitLowering", None)
++    if cls is None:
++        for _n, _c in vars(_low).items():
++            if isinstance(_c, type) and hasattr(_c, "_get_stack_trace"):
++                cls = _c
++                break
++    if cls is None or getattr(cls, "_glm53_patched", False):
++        return
++    orig = cls._get_stack_trace
++
++    def safe_get_stack_trace(self, fx_node):
++        try:
++            return orig(self, fx_node)
++        except Exception:
++            return None
++
++    cls._get_stack_trace = safe_get_stack_trace
++    cls._glm53_patched = True
++
++
++_patch_habana_fx_stack_trace()
++
++
+ def _glm53_dump_loaded_tensors(runner) -> None:
+     """Phase 1 gate artifact: per-rank tensor manifest + HBM, then the caller exits."""
+     import json
+-- 
+2.43.0
+

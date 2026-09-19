@@ -1,0 +1,33 @@
+From 2fc97b5429193ae3794cf1812883e302f18bc7cb Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:16:01 +0000
+Subject: [PATCH] accept fuse_qkv_rmsnorm on MultiHeadLatentAttentionWrapper
+ for glm5next
+
+---
+ vllm/model_executor/layers/mla.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 6c0e8e069..0175e202e 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -69,6 +69,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         skip_topk: bool = False,
+         non_causal_multi_token_decode: bool = False,
+         allow_short_prefill_indexer_scoring_skip: bool = False,
++        fuse_qkv_rmsnorm: bool = False,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = hidden_size
+@@ -98,6 +99,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         # the topk_tokens buffer written by a previous layer in the same pass.
+         # Refer: https://arxiv.org/abs/2603.12201 for more details.
+         self.skip_topk = skip_topk
++        self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+         # qrep is active when the query projection is a DCP-group-sharded layer
+         # that materializes the full group head set locally.
+         q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+-- 
+2.43.0
+

@@ -1,0 +1,58 @@
+# glm53-gaudi2:<date> - GLM-5.3-Flash on 8x Gaudi2.
+# Reproducible from: the pinned Habana base image, upstream vLLM and vllm-gaudi at their base commits, and patches/ only
+# (no live edits). Build from models/glm-5.3-flash/:
+#   docker build -f docker/Dockerfile.glm53 -t glm53-gaudi2:$(date +%Y%m%d) .
+# Run like the bring-up container (sources come from the image; /work only supplies scripts, logs and dumps):
+#   docker run -d --name glm53 --runtime=habana -e HABANA_VISIBLE_DEVICES=all -e HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7 \
+#     --cap-add=sys_nice --ipc=host --net=host --shm-size=64g \
+#     -v /path/to/work:/work -v /path/to/models:/mnt/models glm53-gaudi2:<date>
+FROM vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0@sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_COMMIT=98dff2a81d747d1dba01a47f939f48c3526d4206
+ARG VLLM_GAUDI_REPO=https://github.com/vllm-project/vllm-gaudi.git
+ARG VLLM_GAUDI_COMMIT=2dd55f97eec0bcfcb1f2c52c2d9aee2c4f43f38c
+
+ENV OMPI_MCA_btl_vader_single_copy_mechanism=none \
+    HABANA_VISIBLE_DEVICES=all \
+    PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=on
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git gettext moreutils jq \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/python3 /usr/bin/python
+
+COPY patches/*.patch /opt/glm53/patches/
+COPY docker/apply_patches.sh /opt/glm53/
+
+# Sources at the base commits + patches/ (git am keeps one commit per patch for provenance).
+RUN mkdir -p /opt/vllm /opt/vllm-gaudi \
+ && git -C /opt/vllm init -q && git -C /opt/vllm remote add origin "$VLLM_REPO" \
+ && git -C /opt/vllm fetch -q --depth 1 origin "$VLLM_COMMIT" && git -C /opt/vllm checkout -q --detach FETCH_HEAD \
+ && git -C /opt/vllm-gaudi init -q && git -C /opt/vllm-gaudi remote add origin "$VLLM_GAUDI_REPO" \
+ && git -C /opt/vllm-gaudi fetch -q --depth 1 origin "$VLLM_GAUDI_COMMIT" && git -C /opt/vllm-gaudi checkout -q --detach FETCH_HEAD \
+ && bash /opt/glm53/apply_patches.sh /opt/glm53/patches /opt/vllm /opt/vllm-gaudi \
+ && sha256sum /opt/glm53/patches/*.patch > /opt/glm53/patches.sha256
+
+# Install exactly as vllm-gaudi's .cd/Dockerfile.ubuntu.pytorch.vllm does, pinned to the bring-up container's packages.
+# setuptools is not pinned during the build: vLLM's build requirements need <81, the vllm-gaudi install later
+# upgrades it; the final pin below restores the bring-up container's 84.0.0.
+COPY docker/constraints-glm53.txt /opt/glm53/
+RUN cd /opt/vllm \
+ && sed '/^torch/d' requirements/build/cuda.txt > /tmp/vllm-build-requirements.txt \
+ && pip install -c /opt/glm53/constraints-glm53.txt -r /tmp/vllm-build-requirements.txt \
+ && SETUPTOOLS_SCM_PRETEND_VERSION=0.29.1.dev0+g98dff2a81 VLLM_TARGET_DEVICE=empty \
+    pip install -c /opt/glm53/constraints-glm53.txt --no-build-isolation . \
+ && cd /opt/vllm-gaudi \
+ && VLLM_TARGET_DEVICE=hpu pip install -c /opt/glm53/constraints-glm53.txt --no-build-isolation . \
+ && pip install -c /opt/glm53/constraints-glm53.txt transformers==5.16.1 py-spy==0.4.2 \
+ && pip install setuptools==84.0.0 \
+ && pip install --no-deps --extra-index-url https://download.pytorch.org/whl/cpu torchaudio==2.11.0+cpu \
+ && pip freeze > /opt/glm53/pip-freeze.txt
+
+WORKDIR /work
+CMD ["sleep", "infinity"]

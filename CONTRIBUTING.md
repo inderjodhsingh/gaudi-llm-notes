@@ -22,7 +22,9 @@ templates/model-note/   →   models/<huggingface-or-short-slug>/
 ```
 
 Use the same quality probe across notes when possible (e.g. greedy “count 1…30”).
-Mark any **out-of-tree patch** clearly so a stock vLLM checkout is not assumed.
+Mark any **out-of-tree patch** clearly so a stock vLLM checkout is not assumed. If a model needs a port, put
+the diffs under `models/<slug>/patches/` against the pinned upstream commits, plus a Dockerfile. Do not
+commit hostnames, IPs, usernames, tokens, or firmware serials.
 
 ## Commit style
 

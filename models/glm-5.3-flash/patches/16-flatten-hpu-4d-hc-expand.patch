@@ -1,0 +1,48 @@
+From 39575480fabb082665b88478cb48db7382b4f6ff Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 12:48:45 +0000
+Subject: [PATCH] flatten HPU 4D buckets before mHC hc_expand / decoder loop
+
+---
+ vllm/model_executor/layers/mhc.py    | 8 +++++++-
+ vllm/models/glm5next/nvidia/model.py | 5 +++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/mhc.py b/vllm/model_executor/layers/mhc.py
+index c3b84cf3b..d1a9783a1 100644
+--- a/vllm/model_executor/layers/mhc.py
++++ b/vllm/model_executor/layers/mhc.py
+@@ -580,7 +580,13 @@ class MHCFusedPostPreOp(CustomOp):
+ 
+ 
+ def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+-    """[s, hidden_size] -> [s, n, hidden_size] by replication. From 933876c."""
++    """[s, hidden_size] -> [s, n, hidden_size] by replication. From 933876c.
++
++    HPU buckets pad to 4-D ``[B, 1, S, H]``. Flatten extra dims first so
++    expand is always on a 2-D token layout.
++    """
++    if x.dim() != 2:
++        x = x.reshape(-1, x.size(-1))
+     return x.unsqueeze(1).expand(-1, n, -1).contiguous()
+ 
+ 
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index 039565d80..cb9a24389 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -691,6 +691,11 @@ class Glm5NextModel(nn.Module):
+             post = None
+             comb = None
+ 
++        # HPU model runner feeds [B, 1, S, H] buckets. mHC/KDA/MLA expect [S, H].
++        if hidden_states.dim() > 2:
++            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
++        if positions.dim() > 1:
++            positions = positions.reshape(-1)
+         full_num_tokens = positions.shape[0]
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+-- 
+2.43.0
+

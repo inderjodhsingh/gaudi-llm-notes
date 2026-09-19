@@ -1,0 +1,273 @@
+From cdc12be066bdd5118434f211163b8b9a8f72e8eb Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 14:14:46 +0000
+Subject: [PATCH] HPU DSA: top-k KV gather in MLA latent space replaces the L x
+ L prefill mask and the decode block bias
+
+Prefill keeps the dense kernel output for rows whose visible prefix is <= topk + kpool - 1 (bit-identical to dense
+mode) and recomputes later rows from the 2051 selected latents per query in 1024-row chunks. Decode attends over
+the 2051 selected physical KV slots of each sequence. Selection rule unchanged (HF-verified).
+
+---
+ vllm_gaudi/attention/oot_mla.py   |  78 +++++++++++++------
+ vllm_gaudi/ops/hpu_dsa_indexer.py | 122 ++++++++++++++++++++++++++++++
+ 2 files changed, 175 insertions(+), 25 deletions(-)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index 981db6f..a0a3123 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -16,7 +16,8 @@ from vllm_gaudi.attention.backends.hpu_attn import HPUMLAMetadata
+ import vllm_gaudi.extension.kernels as kernels
+ from vllm.forward_context import ForwardContext, get_forward_context
+ from vllm_gaudi.extension.runtime import get_config
+-from vllm_gaudi.ops.hpu_dsa_indexer import (HPUKpoolIndexer, decode_sparse_block_bias, prefill_sparse_bias)
++from vllm_gaudi.ops.hpu_dsa_indexer import (HPUKpoolIndexer, decode_select_slots, latent_decode_attention,
++                                            latent_gather_attention, pool_keys, prefill_select_tokens)
+ 
+ 
+ class _DummyPrefillBackend:
+@@ -188,12 +189,14 @@ class HPUMLAAttention(MLAAttention):
+                 latent_vec_k = latent_vec_k.reshape(latent_vec_k.shape[0], *k_cache.shape[1:])
+             self.impl.latent_cache_k(latent_vec_k, k_cache, slot_mapping)
+ 
+-        prompt_bias = block_bias = None
+         if sparse is not None:
+-            prompt_bias, block_bias = self._dsa_sparse_bias(q, sparse, slot_mapping, attn_metadata, is_prefill)
++            # k-pool indexer rows for the current tokens (read by later decode steps)
++            self.indexer_kv(sparse[1], self.indexer_cache, slot_mapping)
+ 
+         if is_prefill:
+-            output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata, attn_bias=prompt_bias)
++            output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
++            if sparse is not None:
++                output = self._dsa_sparse_prefill_rows(output, q, latent_vec_k, attn_metadata, sparse)
+             # Fully masked pad query rows (bucket padding) can come out of the fused
+             # attention as NaN; zero them so they cannot leak downstream.
+             seq_lens = getattr(attn_metadata, "seq_lens_tensor", None)
+@@ -207,37 +210,62 @@ class HPUMLAAttention(MLAAttention):
+                     output = torch.where(valid, output, torch.zeros_like(output))
+             return output
+         else:
+-            output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata, block_bias=block_bias)
++            if sparse is not None:
++                output = self._dsa_sparse_decode(decode_ql_nope, kv_cache, attn_metadata, sparse)
++            else:
++                output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
+             output = self._v_up_proj(output)
+             return output
+ 
+-    def _dsa_sparse_bias(self, q, sparse, slot_mapping, attn_metadata, is_prefill):
+-        """Write the current tokens' indexer rows and build the sparse attention bias.
++    _DSA_PREFILL_CHUNK = 1024
++
++    def _dsa_sparse_prefill_rows(self, dense_out, q, latent_vec_k, attn_metadata, sparse):
++        """Top-k KV gather for prefill rows whose visible prefix exceeds topk + kpool - 1 tokens.
+ 
+-        Prefill (no chunking / prefix context): [B, 1, L, L] bias for the fused SDPA.
+-        Decode: [num_blocks, block_size] bias on top of the runner's block-usage bias.
++        Rows [0, topk + kpool - 1) keep the dense kernel output unchanged (sparse selection covers their whole prefix,
++        and slicing the fused SDPA call is not bit-identical), later rows are recomputed from the 2051 selected
++        latents per query in MLA latent space; no L x L mask or bias is built.
+         """
+         ind = self.kpool_indexer
+         assert ind is not None and self.indexer_cache is not None, "DSA sparse: indexer cache not allocated"
++        assert attn_metadata.block_list is None, "DSA sparse prefill needs whole prompts (chunked prefill off)"
++        exact = ind.topk_tokens + ind.kpool - 1
++        bsz = int(attn_metadata.seq_lens_tensor.shape[0])
++        length = q.shape[0] // bsz
++        if length <= exact:
++            return dense_out
+         qi, kg, wi = sparse
+-        self.indexer_kv(kg, self.indexer_cache, slot_mapping)
+-        ape, scale, topk, kpool = ind.index_kpool_compress_ape, ind.softmax_scale, ind.topk_tokens, ind.kpool
+-        if is_prefill:
+-            assert attn_metadata.block_list is None, "DSA sparse prefill needs whole prompts (chunked prefill off)"
+-            bsz = int(attn_metadata.seq_lens_tensor.shape[0])
+-            length = q.shape[0] // bsz
+-            bias = prefill_sparse_bias(qi.view(bsz, length, ind.n_heads, ind.head_dim), kg.view(bsz, length, -1),
+-                                       wi.view(bsz, length, ind.n_heads), ape, scale, topk, kpool,
+-                                       chunk=1024, out_dtype=q.dtype)
+-            return bias, None
++        heads = self.num_heads
++        q4 = q.view(bsz, length, heads, self.qk_head_dim)
++        lat = latent_vec_k.view(bsz, length, self.kv_lora_rank)
++        qi4 = qi.view(bsz, length, ind.n_heads, ind.head_dim)
++        wi3 = wi.view(bsz, length, ind.n_heads)
++        pk = pool_keys(kg.view(bsz, length, -1), ind.index_kpool_compress_ape, ind.kpool)
++        pieces = []
++        for r0 in range(exact, length, self._DSA_PREFILL_CHUNK):
++            r1 = min(r0 + self._DSA_PREFILL_CHUNK, length)
++            idx, valid = prefill_select_tokens(qi4, pk, wi3, ind.softmax_scale, ind.topk_tokens, ind.kpool, r0, r1)
++            q_lat = torch.einsum("bchp,hpr->bchr", q4[:, r0:r1], self.W_UK_T)
++            o = latent_gather_attention(q_lat, lat, idx, valid, self.scale)
++            pieces.append(self._v_up_proj(o.reshape(-1, heads, self.kv_lora_rank)).view(bsz, r1 - r0, -1))
++        dense_rows = dense_out.view(bsz, length, -1)[:, :exact]
++        return torch.cat([dense_rows] + pieces, dim=1).reshape(bsz * length, -1)
++
++    def _dsa_sparse_decode(self, decode_ql_nope, kv_cache, attn_metadata, sparse):
++        """Top-k KV gather for decode: latent attention over the 2051 selected physical KV slots of each sequence."""
++        ind = self.kpool_indexer
++        assert ind is not None and self.indexer_cache is not None, "DSA sparse: indexer cache not allocated"
++        assert attn_metadata.block_kidx is not None, "DSA sparse decode: runner did not provide block_kidx"
++        qi, _, wi = sparse
+         blocks = self.indexer_kv.fetch_from_cache(self.indexer_cache.unflatten(0, (-1, attn_metadata.block_size)),
+                                                   attn_metadata.block_list)
+-        assert attn_metadata.block_kidx is not None, "DSA sparse decode: runner did not provide block_kidx"
+-        bias = decode_sparse_block_bias(qi, wi, blocks, ape, scale, attn_metadata.block_groups,
+-                                        attn_metadata.block_kidx, attn_metadata.block_usage,
+-                                        attn_metadata.attn_bias, topk, kpool)
+-        return None, bias
+-            # NOTE(Xinyu): Make the loaded weight contiguous to avoid the transpose
++        slots, valid = decode_select_slots(qi, wi, blocks, ind.index_kpool_compress_ape, ind.softmax_scale,
++                                           attn_metadata.block_list, attn_metadata.block_groups,
++                                           attn_metadata.block_kidx, attn_metadata.block_usage, ind.topk_tokens,
++                                           ind.kpool)
++        k_cache = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
++        kv_rows = k_cache.reshape(k_cache.shape[0], -1)[:, :self.kv_lora_rank]
++        return latent_decode_attention(decode_ql_nope, kv_rows, slots, valid, self.scale)
+ 
+     # during each graph execution
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
+diff --git a/vllm_gaudi/ops/hpu_dsa_indexer.py b/vllm_gaudi/ops/hpu_dsa_indexer.py
+index c0f4a54..2c2d5b7 100644
+--- a/vllm_gaudi/ops/hpu_dsa_indexer.py
++++ b/vllm_gaudi/ops/hpu_dsa_indexer.py
+@@ -176,6 +176,127 @@ def decode_sparse_block_bias(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.
+     return torch.cat([first, bias[:, 1:]], dim=1)
+ 
+ 
++
++# ---------------------------------------------------------------------------------------------------------------
++# Top-k KV gather (replaces the L x L prefill mask and the per-block decode bias in the serving path).
++# Attention runs in MLA latent space: scores = (q W_UK^T) . c_j and values = W_UV (sum_j a_j c_j), which is the same
++# algebra the HPU MLA decode path already uses, so only the 2051 selected 512-d latents per query are touched.
++# ---------------------------------------------------------------------------------------------------------------
++
++
++def prefill_select_tokens(q: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, scale: float, topk: int, kpool: int,
++                          row0: int, row1: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Token positions attended by query rows [row0, row1) of bucketed prompts (token t at position t).
++
++    q [B, L, H, D] indexer queries, pk [B, L/kpool, D] pooled keys, w [B, L, H] head weights.
++    Requires row0 >= topk + kpool - 1, where every row has at least topk/kpool complete visible pools.
++    Returns idx [B, C, topk + kpool - 1] (topk pool tokens, then kpool-1 tail slots) and valid [B, C, same].
++    """
++    assert row0 >= topk + kpool - 1, (row0, topk, kpool)
++    b = q.shape[0]
++    p_all = pk.shape[1]
++    dev = q.device
++    qpos = torch.arange(row0, row1, device=dev)
++    s = index_scores(q[:, row0:row1], pk, w[:, row0:row1], scale)  # [B, C, P]
++    pool_end = torch.arange(p_all, device=dev) * kpool + (kpool - 1)
++    visible = pool_end.unsqueeze(0) <= qpos.unsqueeze(1)  # [C, P]
++    s = s.masked_fill(~visible.unsqueeze(0), torch.finfo(torch.float32).min)
++    sel = s.topk(topk // kpool, dim=-1).indices  # [B, C, topk/kpool], all visible for row0 >= topk + kpool - 1
++    tok = (sel.unsqueeze(-1) * kpool + torch.arange(kpool, device=dev)).flatten(-2)  # [B, C, topk]
++    tail_start = (qpos + 1) // kpool * kpool
++    tail = tail_start.unsqueeze(1) + torch.arange(kpool - 1, device=dev)  # [C, kpool-1]
++    tail_valid = tail <= qpos.unsqueeze(1)
++    tail = torch.where(tail_valid, tail, qpos.unsqueeze(1))
++    idx = torch.cat([tok, tail.unsqueeze(0).expand(b, -1, -1)], dim=-1)
++    valid = torch.cat([torch.ones_like(tok, dtype=torch.bool), tail_valid.unsqueeze(0).expand(b, -1, -1)], dim=-1)
++    return idx, valid
++
++
++def latent_gather_attention(q_lat: torch.Tensor, lat: torch.Tensor, idx: torch.Tensor, valid: torch.Tensor,
++                            scale: float) -> torch.Tensor:
++    """q_lat [B, C, H, R] (query already multiplied by W_UK^T), lat [B, L, R] prompt latents, idx/valid [B, C, K]
++    positions within each sequence -> latent-space attention output [B, C, H, R] (apply W_UV afterwards)."""
++    b, l, r = lat.shape
++    c, k = idx.shape[1], idx.shape[2]
++    offs = (torch.arange(b, device=idx.device) * l).view(b, 1, 1)
++    sel = lat.reshape(b * l, r).index_select(0, (idx + offs).reshape(-1)).view(b, c, k, r)
++    sc = torch.einsum("bchr,bckr->bchk", q_lat, sel).float() * scale
++    sc = sc.masked_fill(~valid.unsqueeze(2), float("-inf"))
++    a = torch.softmax(sc, dim=-1).to(lat.dtype)
++    return torch.einsum("bchk,bckr->bchr", a, sel)
++
++
++def decode_select_slots(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.Tensor, ape: torch.Tensor, scale: float,
++                        block_list: torch.Tensor, block_groups: torch.Tensor, block_kidx: torch.Tensor,
++                        block_usage: torch.Tensor, topk: int, kpool: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Physical KV slots attended by the current decode token of each (padded) sequence.
++
++    Same selection rule as decode_sparse_block_bias (HF-verified): top topk/kpool complete visible pools of the
++    sequence plus its incomplete tail pool. Inputs as there, plus block_list [N] (physical block id per entry).
++    Returns slots [Bp, topk + kpool - 1] and valid [Bp, same]; a row with nothing valid (pad sequence) gets slot 0
++    marked valid so its attention stays finite.
++    """
++    n, bs = kg_blocks.shape[:2]
++    bp = q.shape[0]
++    dev = q.device
++    pb = bs // kpool
++    is_real = block_groups >= 0
++    grp = block_groups.clamp(min=0).to(torch.long)
++    kidx = block_kidx.to(torch.long)
++    pk = pool_keys(kg_blocks, ape, kpool)  # [N, Pb, D]
++    s = index_scores(q[grp].unsqueeze(1), pk, w[grp].unsqueeze(1), scale).squeeze(1)  # [N, Pb]
++    last = kidx * bs + block_usage.to(torch.long) - 1
++    gidx = torch.where(is_real, grp, torch.full_like(grp, bp))
++    onehot = F.one_hot(gidx, num_classes=bp + 1).to(torch.long)  # [N, Bp+1]
++    seq_qpos = (onehot * last.unsqueeze(1)).amax(dim=0)[:bp]  # [Bp]
++    qpos = seq_qpos[grp]  # [N]
++    pool_end = kidx.unsqueeze(1) * bs + torch.arange(pb, device=dev) * kpool + (kpool - 1)
++    pvalid = (pool_end <= qpos.unsqueeze(1)) & is_real.unsqueeze(1)  # [N, Pb]
++    fmin = torch.finfo(torch.float32).min
++    s = s.masked_fill(~pvalid, fmin).reshape(-1)
++    pvalid = pvalid.reshape(-1)
++    own = grp.repeat_interleave(pb).unsqueeze(0) == torch.arange(bp, device=dev).unsqueeze(1)  # [Bp, N*Pb]
++    s_all = torch.where(own, s.unsqueeze(0), torch.full_like(s, fmin).unsqueeze(0))
++    v_all = own & pvalid.unsqueeze(0)
++    kk = min(topk // kpool, n * pb)
++    sel = s_all.topk(kk, dim=-1).indices  # [Bp, kk]
++    sel_valid = v_all.gather(1, sel)
++    blk = sel // pb
++    phys = block_list.to(torch.long)[blk]  # [Bp, kk]
++    pool_slots = ((phys * bs + (sel % pb) * kpool).unsqueeze(-1) + torch.arange(kpool, device=dev)).flatten(1)
++    pool_valid = sel_valid.unsqueeze(-1).expand(-1, -1, kpool).flatten(1)
++    # tail: tokens after the last complete pool, all inside the block holding the current token
++    in_last = (own.view(bp, n, pb)[:, :, 0] & is_real.unsqueeze(0) & (kidx.unsqueeze(0) * bs <= seq_qpos.unsqueeze(1)) &
++               (seq_qpos.unsqueeze(1) < kidx.unsqueeze(0) * bs + bs))  # [Bp, N]
++    has_last = in_last.any(dim=1)
++    i_last = in_last.to(torch.int32).argmax(dim=1).to(torch.long)
++    tail_start = (seq_qpos + 1) // kpool * kpool
++    tail_pos = tail_start.unsqueeze(1) + torch.arange(kpool - 1, device=dev)
++    tail_valid = (tail_pos <= seq_qpos.unsqueeze(1)) & has_last.unsqueeze(1)
++    tail_slots = (block_list.to(torch.long)[i_last] * bs).unsqueeze(1) + tail_pos - (kidx[i_last] * bs).unsqueeze(1)
++    slots = torch.cat([pool_slots, torch.where(tail_valid, tail_slots, torch.zeros_like(tail_slots))], dim=1)
++    valid = torch.cat([pool_valid, tail_valid], dim=1)
++    if slots.shape[1] < topk + kpool - 1:  # tiny block buckets: pad to the static width
++        pad = topk + kpool - 1 - slots.shape[1]
++        slots = F.pad(slots, (0, pad))
++        valid = F.pad(valid, (0, pad))
++    empty = ~valid.any(dim=1)
++    valid = torch.cat([valid[:, :1] | empty.unsqueeze(1), valid[:, 1:]], dim=1)
++    slots = torch.where(valid, slots, torch.zeros_like(slots))
++    return slots, valid
++
++
++def latent_decode_attention(q_lat: torch.Tensor, kv_rows: torch.Tensor, slots: torch.Tensor, valid: torch.Tensor,
++                            scale: float) -> torch.Tensor:
++    """q_lat [Bp, H, R], kv_rows [num_slots, R] latent cache, slots/valid [Bp, K] -> [Bp, H, R] latent output."""
++    bp, k = slots.shape
++    r = kv_rows.shape[-1]
++    sel = kv_rows.index_select(0, slots.reshape(-1)).view(bp, k, r)
++    sc = torch.einsum("bhr,bkr->bhk", q_lat, sel).float() * scale
++    sc = sc.masked_fill(~valid.unsqueeze(1), float("-inf"))
++    a = torch.softmax(sc, dim=-1).to(kv_rows.dtype)
++    return torch.einsum("bhk,bkr->bhr", a, sel)
++
+ def dense_exact_len(topk: int, kpool: int) -> int:
+     """Longest sequence for which the sparse selection covers every visible token."""
+     return topk + kpool - 1
+@@ -183,5 +304,6 @@ def dense_exact_len(topk: int, kpool: int) -> int:
+ 
+ __all__ = [
+     "HPUKpoolIndexer", "pool_keys", "index_scores", "prefill_sparse_bias", "decode_sparse_block_bias",
++    "prefill_select_tokens", "latent_gather_attention", "decode_select_slots", "latent_decode_attention",
+     "dense_exact_len"
+ ]
+-- 
+2.43.0
+

@@ -1,0 +1,74 @@
+From 850cd5811bc22fd45189b5cdf054979a4503cc0d Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:23:57 +0000
+Subject: [PATCH] HPU GLM-5.3 trace: run <dir>/exec/*.py inside workers (all
+ ranks)
+
+Bring-up debugging aid so per-rank MoE weights/ops can be inspected
+without restarting the 18-minute TP=8 server.
+---
+ vllm_gaudi/glm53_trace.py | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_gaudi/glm53_trace.py b/vllm_gaudi/glm53_trace.py
+index 52d38c2..7cfd6f9 100644
+--- a/vllm_gaudi/glm53_trace.py
++++ b/vllm_gaudi/glm53_trace.py
+@@ -57,17 +57,42 @@ def _find(model, cls_name: str):
+     return None
+ 
+ 
++def _run_exec_scripts(model, out_dir, rank, done: set) -> None:
++    """Run any new ``<out_dir>/exec/*.py`` inside the worker (all ranks).
++
++    Bring-up debugging aid: the script sees ``model``, ``torch``, ``rank``,
++    ``out_dir``, ``logger``. Errors are logged, never raised. Each file runs
++    once per worker; drop a new file (or rename) to run again.
++    """
++    exec_dir = os.path.join(out_dir, "exec")
++    if not os.path.isdir(exec_dir):
++        return
++    for fn in sorted(os.listdir(exec_dir)):
++        if not fn.endswith(".py") or fn in done:
++            continue
++        done.add(fn)
++        path = os.path.join(exec_dir, fn)
++        try:
++            src = open(path).read()
++            g = {"model": model, "torch": torch, "rank": rank, "out_dir": out_dir, "logger": logger, "os": os}
++            exec(compile(src, path, "exec"), g)
++            logger.info("GLM53_TRACE rank%d: exec %s OK", rank, fn)
++        except Exception:
++            logger.exception("GLM53_TRACE rank%d: exec %s FAILED", rank, fn)
++
++
+ def install_trace_hooks(model: torch.nn.Module, out_dir: str, rank: int) -> None:
+     tr = _Tracer(out_dir, rank)
+-    if rank != 0:
+-        return
+ 
+     inner = _find(model, "Glm5NextModel")
+     if inner is None or not hasattr(inner, "layers"):
+         logger.warning("GLM53_TRACE: Glm5NextModel not found; no hooks installed")
+         return
+ 
++    exec_done: set = set()
++
+     def model_pre(mod, args, kwargs):
++        _run_exec_scripts(model, out_dir, rank, exec_done)
+         if not tr.enabled():
+             return
+         tr.step += 1
+@@ -77,6 +102,9 @@ def install_trace_hooks(model: torch.nn.Module, out_dir: str, rank: int) -> None
+         tr.save("positions", pos)
+ 
+     inner.register_forward_pre_hook(model_pre, with_kwargs=True)
++    if rank != 0:
++        logger.info("GLM53_TRACE rank%d: exec hook only", rank)
++        return
+     inner.register_forward_hook(lambda m, a, k, o: tr.save("final_norm_out", o), with_kwargs=True)
+ 
+     for i, layer in enumerate(inner.layers):
+-- 
+2.43.0
+

@@ -1,0 +1,99 @@
+From 3d0200437f2865be7fe8876bba66a23bc1ceb8b1 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 22:22:33 +0000
+Subject: [PATCH 1/2] HPU: GLM53_DEBUG_SYMBOLIC diagnostics for Habana
+ symbolic-recipe failures (debug aid, env-gated)
+
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 44 ++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index d3ba9ec..c90c65a 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -165,6 +165,50 @@ def _patch_habana_fx_stack_trace() -> None:
+ _patch_habana_fx_stack_trace()
+ 
+ 
++def _patch_habana_symbolic_diagnostics() -> None:
++    """GLM53_DEBUG_SYMBOLIC=1: when the Habana recipe compiler takes the symbolic
++    (dynamic-shape) path and fails, log which FX placeholders are symbolic."""
++    if os.environ.get("GLM53_DEBUG_SYMBOLIC", "0") != "1":
++        return
++    try:
++        from habana_frameworks.torch.dynamo.compile_backend import recipe_compiler as _rc
++    except Exception:
++        return
++    if getattr(_rc, "_glm53_patched", False):
++        return
++    orig = _rc.get_input_symbolic
++
++    def wrapped(graph_module, inputs):
++        try:
++            return orig(graph_module, inputs)
++        except Exception:
++            lines = []
++            for node in graph_module.graph.nodes:
++                if node.op != "placeholder":
++                    continue
++                val = node.meta.get("val", None)
++                try:
++                    if hasattr(val, "size"):
++                        sizes = [str(d) for d in val.size()]
++                        sym = any(not isinstance(d, int) for d in val.size())
++                        lines.append(f"{node.name}: {'SYM ' if sym else ''}{sizes} {getattr(val, 'dtype', '')}")
++                    else:
++                        lines.append(f"{node.name}: {type(val).__name__} {val}")
++                except Exception as e:  # pragma: no cover
++                    lines.append(f"{node.name}: <{e}>")
++            ops = [str(n.target) for n in graph_module.graph.nodes if n.op == "call_function"][:40]
++            logger.error("GLM53 symbolic-graph diagnostics: automatic_dynamic=%s assume_static=%s\nplaceholders:\n%s\nops: %s",
++                         torch._dynamo.config.automatic_dynamic_shapes, torch._dynamo.config.assume_static_by_default,
++                         "\n".join(lines), ops)
++            raise
++
++    _rc.get_input_symbolic = wrapped
++    _rc._glm53_patched = True
++
++
++_patch_habana_symbolic_diagnostics()
++
++
+ def _glm53_dump_loaded_tensors(runner) -> None:
+     """Phase 1 gate artifact: per-rank tensor manifest + HBM, then the caller exits."""
+     import json
+-- 
+2.43.0
+
+
+From f9c47ee753dcc4ea5de94106d6e8821cfd75e0d4 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 22:45:08 +0000
+Subject: [PATCH 2/2] HPU: symbolic-recipe diagnostics also dump the FX graph
+ to /work/logs
+
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index c90c65a..ddfc351 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -197,6 +197,12 @@ def _patch_habana_symbolic_diagnostics() -> None:
+                 except Exception as e:  # pragma: no cover
+                     lines.append(f"{node.name}: <{e}>")
+             ops = [str(n.target) for n in graph_module.graph.nodes if n.op == "call_function"][:40]
++            try:
++                rank = int(os.environ.get("RANK", "0"))
++                with open(f"/work/logs/symbolic_graph_rank{rank}.txt", "a") as f:
++                    f.write("\n".join(lines) + "\n---- graph ----\n" + str(graph_module.graph) + "\n\n")
++            except Exception:
++                pass
+             logger.error("GLM53 symbolic-graph diagnostics: automatic_dynamic=%s assume_static=%s\nplaceholders:\n%s\nops: %s",
+                          torch._dynamo.config.automatic_dynamic_shapes, torch._dynamo.config.assume_static_by_default,
+                          "\n".join(lines), ops)
+-- 
+2.43.0
+

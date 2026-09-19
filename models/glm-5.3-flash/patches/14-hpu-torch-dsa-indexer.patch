@@ -1,0 +1,161 @@
+From 2c453870b50238f8eb3567b9e4f478dc43e6b09b Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 12:01:30 +0000
+Subject: [PATCH] HPU torch DSA indexer: BF16 MQA logits, static topk,
+ gather-attend
+
+---
+ vllm_gaudi/models/__init__.py     |   1 +
+ vllm_gaudi/ops/hpu_dsa_indexer.py | 128 ++++++++++++++++++++++++++++++
+ 2 files changed, 129 insertions(+)
+ create mode 100644 vllm_gaudi/ops/hpu_dsa_indexer.py
+
+diff --git a/vllm_gaudi/models/__init__.py b/vllm_gaudi/models/__init__.py
+index fe7a2f5..b4a1a39 100644
+--- a/vllm_gaudi/models/__init__.py
++++ b/vllm_gaudi/models/__init__.py
+@@ -74,6 +74,7 @@ def register_model():
+     import vllm_gaudi.models.qwen3_next  # noqa: F401
+     import vllm_gaudi.models.qwen3_5  # noqa: F401
+     import vllm_gaudi.models.glm5next_kda  # noqa: F401
++    import vllm_gaudi.ops.hpu_dsa_indexer  # noqa: F401
+     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
+     import vllm_gaudi.models.kimi_k25  # noqa: F401
+     import vllm_gaudi.models.gemma4_mm  # noqa: F401
+diff --git a/vllm_gaudi/ops/hpu_dsa_indexer.py b/vllm_gaudi/ops/hpu_dsa_indexer.py
+new file mode 100644
+index 0000000..bd6f496
+--- /dev/null
++++ b/vllm_gaudi/ops/hpu_dsa_indexer.py
+@@ -0,0 +1,128 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Torch-native DSA indexer for GLM-5.3-Flash on HPU (Phase 3b).
++
++No DeepGEMM / FWHT-FP8 / kpool CUDA. BF16 MQA logits, F32 weight projection,
++static ``torch.topk``, ``index_select`` gather. Causal: scores for s>t are -inf.
++
++When prefix length <= index_topk (2048), selecting the full prefix is exact
++vs dense MLA.
++"""
++from __future__ import annotations
++
++import torch
++import torch.nn.functional as F
++
++
++def indexer_k_norm(k: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
++    d = k.shape[-1]
++    return F.layer_norm(k.float(), (d,), weight.float(), bias.float(), eps).type_as(k)
++
++
++def indexer_mqa_logits(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    weights: torch.Tensor,
++    scale: float,
++) -> torch.Tensor:
++    """ReLU-weighted MQA logits.
++
++    q: [Tq, H, D], k: [Tk, D] (shared across heads), weights: [Tq, H]
++    returns scores [Tq, Tk] float32
++    """
++    qf = q.float()
++    kf = k.float()
++    # [Tq, H, Tk]
++    logits = torch.matmul(qf, kf.transpose(0, 1).contiguous()) * float(scale)
++    w = F.relu(weights.float()).unsqueeze(-1)
++    return (w * logits).sum(dim=1)
++
++
++def causal_prefix_mask(scores: torch.Tensor) -> torch.Tensor:
++    """scores [Tq, Tk]; assume Tq==Tk for prefill aligned sequences."""
++    tq, tk = scores.shape
++    t = min(tq, tk)
++    mask = torch.ones(tq, tk, dtype=torch.bool, device=scores.device)
++    mask[:t, :t] = torch.triu(mask[:t, :t], diagonal=1)
++    if tq > t:
++        mask[t:, :] = True
++    if tk > t:
++        mask[:, t:] = True
++    return scores.masked_fill(mask, float("-inf"))
++
++
++def indexer_topk(
++    scores: torch.Tensor,
++    topk: int,
++    pad_to: int | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Static-k topk. Pad prefix scores with -inf if pad_to > Tk.
++
++    returns (values [Tq, K], indices [Tq, K])
++    """
++    tq, tk = scores.shape
++    k = min(int(topk), tk if pad_to is None else max(tk, pad_to))
++    if pad_to is not None and pad_to > tk:
++        pad = scores.new_full((tq, pad_to - tk), float("-inf"))
++        scores = torch.cat([scores, pad], dim=-1)
++        tk = pad_to
++        k = min(int(topk), tk)
++    return torch.topk(scores, k=k, dim=-1, sorted=True)
++
++
++def gather_kv(k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Gather MLA K/V. k,v: [T, H, D], indices: [Tq, K] -> [Tq, K, H, D]."""
++    t, h, d = k.shape
++    tq, kk = indices.shape
++    idx = indices.clamp(0, t - 1)
++    flat = idx.reshape(-1)
++    kg = k.index_select(0, flat).view(tq, kk, h, d)
++    vg = v.index_select(0, flat).view(tq, kk, h, d)
++    return kg, vg
++
++
++def sparse_attend(
++    q: torch.Tensor,
++    k_g: torch.Tensor,
++    v_g: torch.Tensor,
++    scale: float,
++    idx: torch.Tensor,
++    query_pos: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Attend q [Tq,H,D] to gathered k/v [Tq,K,H,D]. Causal on original positions."""
++    tq, h, d = q.shape
++    scores = torch.einsum("thd,tkhd->thk", q.float(), k_g.float()) * float(scale)
++    if query_pos is None:
++        query_pos = torch.arange(tq, device=q.device)
++    # mask gathered keys that are strictly after the query token
++    invalid = idx > query_pos.unsqueeze(-1)
++    scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
++    attn = torch.softmax(scores, dim=-1)
++    out = torch.einsum("thk,tkhd->thd", attn, v_g.float())
++    return out.to(q.dtype)
++
++
++def kpool_last_wins(k: torch.Tensor, kpool: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
++    """Pool-granular K: last token of each complete pool (ROCm last-wins).
++
++    k: [T, D] -> pooled [n_pool, D] and pool-end positions [n_pool]
++    """
++    t = k.shape[0]
++    n = t // kpool
++    if n == 0:
++        return k[:0], k.new_zeros((0,), dtype=torch.long)
++    ends = torch.arange(kpool - 1, n * kpool, kpool, device=k.device)
++    return k.index_select(0, ends), ends
++
++
++def kpool_softmax(k: torch.Tensor, gate: torch.Tensor, ape: torch.Tensor, kpool: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
++    """Softmax-weighted pool of kpool tokens. gate/k: [T, D], ape: [kpool, D]."""
++    t, d = k.shape
++    n = t // kpool
++    if n == 0:
++        return k[:0], k.new_zeros((0,), dtype=torch.long)
++    k4 = k[: n * kpool].view(n, kpool, d)
++    g4 = gate[: n * kpool].view(n, kpool, d)
++    w = torch.softmax(g4.float() + ape.float().unsqueeze(0), dim=1)
++    pooled = (w * k4.float()).sum(dim=1).to(k.dtype)
++    ends = torch.arange(kpool - 1, n * kpool, kpool, device=k.device)
++    return pooled, ends
+-- 
+2.43.0
+

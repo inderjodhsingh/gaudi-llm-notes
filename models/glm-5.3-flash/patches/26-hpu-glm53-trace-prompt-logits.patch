@@ -1,0 +1,43 @@
+From ee8fa2e22a017694809624b7778d12cc2c31ca0a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:48:25 +0000
+Subject: [PATCH] HPU GLM-5.3 trace: save prompt logits as logits_T<n>;
+ NOLAYERS flag
+
+---
+ vllm_gaudi/glm53_trace.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/glm53_trace.py b/vllm_gaudi/glm53_trace.py
+index 7cfd6f9..a236a1e 100644
+--- a/vllm_gaudi/glm53_trace.py
++++ b/vllm_gaudi/glm53_trace.py
+@@ -34,6 +34,9 @@ class _Tracer:
+     def save(self, tag: str, t) -> None:
+         if not self.enabled():
+             return
++        # <dir>/NOLAYERS: keep only input_ids/positions/logits (cheap gate runs)
++        if tag.startswith("L") and os.path.exists(os.path.join(self.out_dir, "NOLAYERS")):
++            return
+         if isinstance(t, (tuple, list)):
+             t = t[0] if len(t) else None
+         if t is None or not torch.is_tensor(t):
+@@ -134,7 +137,14 @@ def install_trace_hooks(model: torch.nn.Module, out_dir: str, rank: int) -> None
+ 
+     lp = _find(model, "LogitsProcessor")
+     if lp is not None:
+-        lp.register_forward_hook(lambda m, a, k, o: tr.save("logits", o), with_kwargs=True)
++
++        def logits_hook(m, a, k, o):
++            # sampled-token logits are [B, V]; prompt_logprobs logits are [T, V]
++            tr.save("logits", o)
++            if torch.is_tensor(o) and o.dim() == 2 and o.shape[0] > 1:
++                tr.save(f"logits_T{o.shape[0]}", o)
++
++        lp.register_forward_hook(logits_hook, with_kwargs=True)
+ 
+     logger.info("GLM53_TRACE: hooks installed on %d layers, dir=%s (touch %s to enable)", len(inner.layers), out_dir,
+                 tr.flag)
+-- 
+2.43.0
+

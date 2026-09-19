@@ -1,0 +1,41 @@
+From 5e674cebf17047a3e96671b8da728d3feb4bafa5 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 17:09:09 +0000
+Subject: [PATCH] HPU runner: prompt logprobs with 2-D (flattened) prefill
+ hidden states
+
+glm5_next returns [B*S, H]; per-request indexing on the raw tensor took a
+single row and compute_logits got a 1-D vector (mat1 1x4). View as
+[B, S, H] first.
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index d7020f1..52bab16 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -4574,10 +4574,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
+                 # Collect prefill hidden states for prompt logprobs.
+                 # req_id is a list of request IDs in this prefill batch.
++                # Models that flatten the [B, 1, S, H] bucket internally
++                # (glm5_next, patch 16) return [B*S, H]; index per request on
++                # a [B, S, H] view or `[i]` picks a single row and the later
++                # `hs[:num_logits]` slice feeds a 1-D vector to compute_logits.
++                nf_hs = non_flattened_hidden_states
++                if nf_hs.dim() == 2:
++                    nf_hs = nf_hs.view(len(req_id), -1, nf_hs.shape[-1])
++                elif nf_hs.dim() == 4:
++                    nf_hs = nf_hs.reshape(nf_hs.shape[0], -1, nf_hs.shape[-1])
+                 for i, rid in enumerate(req_id):
+                     if rid in self.input_batch.num_prompt_logprobs:
+-                        prefill_hidden_states_for_logprobs[rid] = \
+-                            non_flattened_hidden_states[i]
++                        prefill_hidden_states_for_logprobs[rid] = nf_hs[i]
+                 if self.use_aux_hidden_state_outputs:
+                     aux_hidden_states_prefills.append(aux_hidden_states)
+                 sample_hidden_states_prefills.append(sample_hidden_states)
+-- 
+2.43.0
+

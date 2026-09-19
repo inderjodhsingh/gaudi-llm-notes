@@ -1,0 +1,36 @@
+From d012639994f6b8664e22b2707537e546ec07cdbe Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:14:14 +0000
+Subject: [PATCH] register glm5_next in _CONFIG_REGISTRY so vLLM Glm5NextConfig
+ (is_moe/is_kda_layer) is used
+
+---
+ vllm/transformers_utils/config.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index b5b0ccd8f..3d5380e58 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -124,6 +124,9 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
+     step3p5="Step3p5Config",
+     qianfan_ocr="QianfanOCRConfig",
+     qwen3_asr="Qwen3ASRConfig",
++    glm5_next="Glm5NextConfig",
++    glm5_next_text="Glm5NextTextConfig",
++    glm5_next_vision="Glm5NextVisionConfig",
+     qwen3_next="Qwen3NextConfig",
+     qwen4_exp="Qwen4ExpConfig",
+     qwen4_exp_text="Qwen4ExpTextConfig",
+@@ -148,6 +151,8 @@ _PATCH_HF_VALIDATE_ROPE: set[str] = {"sarvam_mla"}
+ # `deepseek_sparse_attention`). Extend the allowed set for these model types.
+ _PATCH_HF_ALLOWED_LAYER_TYPES: dict[str, tuple[str, ...]] = {
+     "glm_moe_dsa": ("deepseek_sparse_attention",),
++    "glm5_next": ("deepseek_sparse_attention", "linear_attention"),
++    "glm5_next_text": ("deepseek_sparse_attention", "linear_attention"),
+ }
+ 
+ _CONFIG_ATTRS_MAPPING: dict[str, str] = {
+-- 
+2.43.0
+

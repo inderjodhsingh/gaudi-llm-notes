@@ -1,13 +1,17 @@
 # Recipe — 742 output tok/s at 128 concurrent, 17.7 tok/s single stream, 256K context
 
-Checkpoint: `orcarouter/GLM-5.3-Flash-Uncensored-FP8` (fallback `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`)
+Checkpoint: `orcarouter/GLM-5.3-Flash-Uncensored-FP8` (fallback `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`; official
+`zai-org/GLM-5.3-Flash` is the same 62-shard ~306 GB FP8 layout — drop-in).
 Hardware: 8× Intel Gaudi2 96 GB, TP=8 / EP=8. The weights are ~306 GB FP8, so all eight cards are needed.
 
 Download to a **local directory** and always pass that path, never a repo id: the `glm5next` processor joins paths
-against the model directory and needs `processor_config.json` next to the weights.
+against the model directory and needs `processor_config.json` next to the weights (stock Hub file; a copy is
+[`processor_config.json`](processor_config.json) in this folder). The port does not depend on a modified quant block
+layout — OrcaRouter is an uncensored copy of the same FP8, not a different scheme.
 
 ```bash
-hf download orcarouter/GLM-5.3-Flash-Uncensored-FP8 --local-dir /path/to/glm-5.3-flash
+hf download zai-org/GLM-5.3-Flash --local-dir /path/to/glm-5.3-flash
+# or: hf download orcarouter/GLM-5.3-Flash-Uncensored-FP8 --local-dir /path/to/glm-5.3-flash
 ```
 
 ## Common environment
@@ -97,9 +101,12 @@ configuration here, including 32K, and is not by itself a failure.
   --reasoning-parser glm45 --enable-prompt-tokens-details
 ```
 
-Multi-turn tool chains and JSON structured output both work. `enable_thinking: false` is not honoured by the chat
-template — reasoning text and a stray closing tag leak into `content`. Use `reasoning_effort` (`low`, `high`, or the
-default `max`) instead; `high` versus the default made no measurable difference on a 12-turn agent task.
+Multi-turn tool chains and JSON structured output both work. Pass
+[`chat_templates/chat_template.enable-thinking-switch.jinja`](chat_templates/chat_template.enable-thinking-switch.jinja)
+as `--chat-template`. It honours `chat_template_kwargs.enable_thinking`: `false` emits `<think></think>` so
+generation starts in content mode (no leaked reasoning, no stray `</think>`); `true` (default) opens `<think>`
+like the stock template. Tool calls parse in both modes. `reasoning_effort` (`low`, `high`, or the default `max`)
+still works; `high` versus the default made no measurable difference on a 12-turn agent task.
 
 ## Sparse DSA (optional, slower)
 
@@ -113,10 +120,14 @@ unchanged. Dense is the default for serving. Only enable this if you are working
 
 ## Out-of-tree (required — upstream vLLM ships this architecture CUDA-only)
 
-`vllm/models/glm5next/` is an NVIDIA-only subpackage upstream. The port is a numbered patch series applied to pinned
-upstream checkouts; **patches 01–48** are the port, 49–50 add warmup ordering and per-rank memory logging. The whole
-thing is reproducible as a container image built from the pinned Habana base plus upstream commits by hash plus the
-patch files, with no live edits.
+`vllm/models/glm5next/` is an NVIDIA-only subpackage upstream. The port is a numbered `git am` series in
+[`patches/`](patches/) against vLLM `98dff2a8` and vllm-gaudi `2dd55f97`. **01–48** are the port, **45 is the
+sampling-metadata cache-key fix** (included), 49–50 add warmup ordering and per-rank memory logging. That 01–50 set
+is what the measured image (`glm53-gaudi2:20260915`) contains. 51–65 live under [`patches/optional/`](patches/optional/)
+and are **not** in the shared image (MTP experiments, expert-drop; the latter slows decode).
+
+Build: [`docker/Dockerfile.glm53`](docker/Dockerfile.glm53) + [`docker/apply_patches.sh`](docker/apply_patches.sh).
+No custom TPC / `.so`.
 
 What the port covers, in rough order of importance:
 
@@ -153,5 +164,9 @@ What the port covers, in rough order of importance:
 
 ## Versions this recipe was measured on
 
-Habana **1.24.1**, vLLM **0.29.1.dev** (`98dff2a8`), vllm-gaudi **releases/v0.29.0** (`2dd55f97`) plus the patch
-series above, torch 2.11.0a0. Measured 2026-09-13 to 2026-09-16 on 8× Gaudi2 96 GB.
+- Base image: `vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0` digest `sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8`
+- Pip pins that differ from the base: **transformers 5.16.1**, vLLM `0.29.1.dev0+g98dff2a81`, matching vllm-gaudi, `setuptools==84.0.0`, `torchaudio==2.11.0+cpu` (no-deps). Full freeze: [`docker/constraints-glm53.txt`](docker/constraints-glm53.txt).
+- Host: Ubuntu 24.04.3, kernel **6.8.0-137-generic**, `habanalabs-dkms` **1.24.1-482**, driver **1.24.1-b336d5e**, HL-SMI `hl-1.24.0-fw-62.6.2.0`. SPI preboot on this box was **hl-gaudi2-1.21.2-fw-61.0.0-sec-11** (older than the 1.24.0-fw-62.6.2-sec-11 Flash-Next box); CPLD `0x10` (2023-10-30). A failure that only reproduces on one SPI level is a host problem, not the port.
+- No custom ops / TPC / shared libraries.
+
+Measured 2026-09-13 to 2026-09-16 on 8× Gaudi2 96 GB.

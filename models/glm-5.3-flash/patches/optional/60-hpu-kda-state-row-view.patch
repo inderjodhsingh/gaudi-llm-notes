@@ -1,0 +1,32 @@
+From 52b0b44aaf8f0788c5f0524307acb0c5821c162a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 15:46:28 +0000
+Subject: [PATCH] patch 60: KDA state-row pick is a view, not 34 eager
+ index_select launches per step
+
+---
+ vllm_gaudi/models/glm5next_kda.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index 9920848..bcc582e 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -69,8 +69,13 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         cg = self.cache_group_idx
+         if cg is None:
+             return indices[0] if indices.size(0) > 1 else indices.squeeze(0)
++        # Basic integer indexing on dim 0 is a VIEW: no kernel, no copy. index_select launches a real HPU op, and
++        # this runs eagerly (the method is @torch._dynamo.disable'd) once per KDA layer per decode step -- 34 launches
++        # per step for only 4 distinct cache groups, so 30 of them recomputed a byte-identical result. Keep the
++        # tensor path only for the case where cache_group_idx is itself a tensor; converting that to an int here
++        # would force a device sync, which is worse than the op it saves.
+         if not torch.is_tensor(cg):
+-            cg = torch.tensor(cg, dtype=torch.long, device=indices.device)
++            return indices[int(cg)]
+         return indices.index_select(0, cg.view(-1).to(device=indices.device)[:1]).squeeze(0)
+ 
+     @torch._dynamo.disable
+-- 
+2.43.0
+

@@ -1,0 +1,96 @@
+From 2a5d0ffc1fe497db3b223fb105dff7aef83a9d65 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 03:32:16 +0000
+Subject: [PATCH] patch 52: one-shot proof logs for the all-reduce mode and the
+ clamped-SwiGLU MoE branch
+
+---
+ .../device_communicators/hpu_communicator.py  | 21 +++++++++++++++++++
+ vllm_gaudi/ops/hpu_fused_moe.py               | 18 +++++++++++++++-
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/distributed/device_communicators/hpu_communicator.py b/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
+index 451a064..9094f5e 100644
+--- a/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
++++ b/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
+@@ -13,6 +13,18 @@ import os
+ 
+ import habana_frameworks.torch as htorch  # noqa: F401
+ 
++import sys
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def _proof(msg: str) -> None:
++    """Unfilterable one-shot marker. logger.info from this module does not reach the serve log, and a flag that
++    silently fails to apply must not look like a null result."""
++    print(f"[HPU-PROOF] {msg}", file=sys.stderr, flush=True)
++
+ from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
+ 
+ # VLLM_HPU_ALLREDUCE_MODE selects how the TP/EP all-reduce sums partials. Ported from
+@@ -44,6 +56,11 @@ _ALLREDUCE_ALT_MAX_BYTES = int(os.environ.get("VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES"
+ # compile mode (PT_HPU_LAZY_MODE=0), which is what this port runs; kept behind a switch so
+ # the behaviour is explicit rather than incidental.
+ _ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "1") == "1"
++_proof(f"allreduce import: mode={_ALLREDUCE_MODE} large={_ALLREDUCE_LARGE_MODE} "
++       f"alt_max_bytes={_ALLREDUCE_ALT_MAX_BYTES} markstep={_ALLREDUCE_MARKSTEP}")
++# One-shot proof that a given branch really executed, so a flag that silently does not apply is visible in the log
++# rather than showing up as a null result.
++_ALLREDUCE_SEEN: set = set()
+ 
+ 
+ def sum_in_rank_order(gathered: torch.Tensor, world_size: int, dtype: torch.dtype) -> torch.Tensor:
+@@ -97,6 +114,10 @@ class HpuCommunicator(DeviceCommunicatorBase):
+         factor = self.world_size if _ALLREDUCE_MODE == "gather_sum" else 2
+         working_bytes = input_.numel() * input_.element_size() * factor
+         mode = _ALLREDUCE_MODE if working_bytes <= _ALLREDUCE_ALT_MAX_BYTES else _ALLREDUCE_LARGE_MODE
++        if mode not in _ALLREDUCE_SEEN:
++            _ALLREDUCE_SEEN.add(mode)
++            _proof(f"allreduce first {mode} call: numel={input_.numel()} dtype={input_.dtype} "
++                   f"working_bytes={working_bytes} cap={_ALLREDUCE_ALT_MAX_BYTES}")
+         if mode == "gather_sum":
+             flat = input_.reshape(-1).contiguous()
+             gathered = torch.empty(self.world_size * flat.numel(), dtype=flat.dtype, device=flat.device)
+diff --git a/vllm_gaudi/ops/hpu_fused_moe.py b/vllm_gaudi/ops/hpu_fused_moe.py
+index 111c82d..868065e 100644
+--- a/vllm_gaudi/ops/hpu_fused_moe.py
++++ b/vllm_gaudi/ops/hpu_fused_moe.py
+@@ -195,6 +195,15 @@ _MOE_DECODE_GATHER = gaudi_envs.VLLM_MINIMAX_M3_MOE_DECODE_GATHER
+ # Only gather when the batch is at most this many tokens (bounds gather to the
+ # low-concurrency decode regime where it wins; above it the dense pass is used).
+ _MOE_GATHER_MAX_TOKENS = gaudi_envs.VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS
++import sys as _sys  # noqa: E402
++
++
++def _moe_proof(msg: str) -> None:
++    print(f"[HPU-PROOF] {msg}", file=_sys.stderr, flush=True)
++
++
++_moe_proof(f"moe import: decode_gather={_MOE_DECODE_GATHER} max_tokens={_MOE_GATHER_MAX_TOKENS}")
++_MOE_BRANCH_SEEN: set = set()
+ 
+ 
+ def _gather_swigluoai_moe(
+@@ -294,7 +303,14 @@ def _swigluoai_moe(
+     tokens = x.shape[0]
+     k = topk_ids.shape[-1]
+     e_local = layer.w13_weight.shape[0]
+-    if (_MOE_DECODE_GATHER and tokens <= _MOE_GATHER_MAX_TOKENS and tokens * k < e_local):
++    use_gather = (_MOE_DECODE_GATHER and tokens <= _MOE_GATHER_MAX_TOKENS and tokens * k < e_local)
++    # One-shot per (branch, token count) so a flag that silently does not apply is visible in the log.
++    _key = (use_gather, tokens)
++    if _key not in _MOE_BRANCH_SEEN:
++        _MOE_BRANCH_SEEN.add(_key)
++        _moe_proof(f"moe branch={'gather' if use_gather else 'dense'} tokens={tokens} k={k} "
++                   f"e_local={e_local} env_gather={_MOE_DECODE_GATHER}")
++    if use_gather:
+         return _gather_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
+     return _unfused_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
+ 
+-- 
+2.43.0
+

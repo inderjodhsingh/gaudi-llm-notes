@@ -68,6 +68,13 @@ ceiling actually comes from.
 Single-stream decode is flat in context length: 57 ms/token at 4K, 62 ms at 64K, ~80 ms at 90K with 8 streams.
 A 16-concurrent soak (1024 in / 256 out, 512 requests) completed 512/512 in 1037 s with 0 recompiles.
 
+TPOT 57 → 68 ms from 1 to 32 streams is **~0.35 ms per extra stream**. That is the v0.29 compile-mode Gaudi2
+shape (a dense 27B on the same stack dropped from ~2.8 ms to ~0.7 ms per extra stream moving 0.26 → 0.29). The
+sampling-metadata cache (patch 45) removes a ~5 ms H2D that would sit on **every** step regardless of batch; static
+shapes stop per-step recompiles that would destroy the curve. The step is still host/launch bound (~56 ms vs a
+~17 ms weight-bandwidth floor; a decode profile saw 241 recipe enqueues and an eager MoE op every layer from patch
+37). We did not add a new batched GEMM.
+
 ## Context
 
 Dense MLA (the serving default), needle retrieval = a 6-digit code inserted at a depth in filler prose, greedy answer:
@@ -225,11 +232,12 @@ as a DSA layer rather than KDA. It still does not run:
   acceptable, or the MoE activations need per-group scales or BF16, is a judgement call, not a bug.
 - Needle retrieval 10/10 at 96K and 128K, both depths. Tool calling works end to end with the `glm47` parser and the
   `glm45` reasoning parser, including multi-turn chains and JSON structured output.
-- Known template issue: `enable_thinking: false` leaks reasoning text and a stray closing tag into `content`; the
-  chat template has no switch for it.
+- Thinking switch: use [`chat_templates/chat_template.enable-thinking-switch.jinja`](chat_templates/chat_template.enable-thinking-switch.jinja)
+  (`--chat-template`). Stock template ignores `enable_thinking: false` and leaks reasoning plus a stray `</think>`
+  into `content`. The switch template emits `<think></think>` when thinking is off.
 
 ## Versions
 
 - Habana / driver **1.24.1** (`vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0`)
-- vLLM **0.29.1.dev** (`98dff2a8`), vllm-gaudi **releases/v0.29.0** (`2dd55f97`) + the out-of-tree port
-- torch 2.11.0a0, `PT_HPU_LAZY_MODE=0`
+- vLLM **0.29.1.dev** (`98dff2a8`), vllm-gaudi **releases/v0.29.0** (`2dd55f97`) + [`patches/`](patches/) 01–50
+- torch 2.11.0a0, `PT_HPU_LAZY_MODE=0`. Host/firmware: see [RECIPE.md](RECIPE.md).

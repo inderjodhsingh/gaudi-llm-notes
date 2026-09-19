@@ -1,0 +1,80 @@
+From 9a926155473b81da10643fe1b3829fecbaabf84a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 13:35:17 +0000
+Subject: [PATCH] HPU: skip dead as_strided in Habana batch_as_strided pass
+
+Decoder-layer regional compile hit IndexError on list(node.users)[0]
+when GLM graphs contain unused as_strided views.
+---
+ vllm_gaudi/platform.py | 45 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/vllm_gaudi/platform.py b/vllm_gaudi/platform.py
+index 8fba893..23ca688 100644
+--- a/vllm_gaudi/platform.py
++++ b/vllm_gaudi/platform.py
+@@ -33,9 +33,46 @@ def _hpu_get_memory_info(device=None) -> tuple[int, int]:
+ 
+ torch.accelerator.get_memory_info = _hpu_get_memory_info
+ 
++
++def _patch_hpu_batch_as_strided() -> None:
++    """Habana pass_batch_as_strided_groups does list(node.users)[0].
++
++    GLM decoder-layer graphs have dead as_strided views (empty users), which
++    raises IndexError in hpu_backend. Drop those nodes from each partition.
++    """
++    try:
++        from habana_frameworks.torch.dynamo.compile_backend._passes import (
++            batch_as_strided as _bas,
++        )
++    except Exception:
++        return
++    _orig = _bas.batch_as_strided
++
++    def _safe_batch_as_strided(graph_module, clusters):
++        for part in clusters:
++            nodes = getattr(part, "nodes", None)
++            if not nodes:
++                continue
++            live = [n for n in list(nodes) if getattr(n, "users", None)]
++            if live is nodes or len(live) == len(nodes):
++                continue
++            try:
++                part.nodes = live
++            except Exception:
++                nodes.clear()
++                nodes.extend(live)
++        return _orig(graph_module, clusters)
++
++    _bas.batch_as_strided = _safe_batch_as_strided
++
++
++_patch_hpu_batch_as_strided()
++
+ QWEN3_5_HYBRID_ARCHS = frozenset({
+     "Qwen3_5ForConditionalGeneration",
+     "Qwen3_5MoeForConditionalGeneration",
++    "Qwen4ExpForCausalLM",
++    "Qwen4ExpForConditionalGeneration",
+ })
+ 
+ 
+@@ -136,6 +173,14 @@ class HpuPlatform(Platform):
+ 
+         return total_hpu_memory
+ 
++    @classmethod
++    def check_runner_kv_caches_multi_layer(cls) -> None:
++        # The HPU runner keeps kv_caches as an unordered list of per-layer
++        # tuples (attention: (k, v, ...), mamba: state tensors); nothing indexes
++        # it by decoder-layer position, so hybrid layers that share a layer
++        # index (e.g. Qwen4Exp GDN + PLE in the same block) are fine.
++        return
++
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+         # Apply torch.compile/eager-only env defaults here (engine construction
+-- 
+2.43.0
+

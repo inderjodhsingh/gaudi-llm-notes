@@ -1,0 +1,29 @@
+From 526b6645ba3099d265b3f7cdaac007efad9f4a9b Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 20:39:04 +0000
+Subject: [PATCH] HPU paged attention: b2b_impl reshape instead of view
+ (non-contiguous MLA decode query, batch>1)
+
+---
+ vllm_gaudi/extension/ops.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index 987aacd..621fa18 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -99,7 +99,10 @@ def grouped_max(block_max, batch_size, block_groups):
+ 
+ def b2b_impl(tensor, block_mapping, matmul_op):
+     shape = tuple(tensor.shape)
+-    return matmul_op(block_mapping, tensor.view(shape[0], -1)).view(-1, *shape[1:])
++    # reshape, not view: the MLA decode query (B, N, L) arrives as a transposed
++    # bmm output (non-contiguous once B > 1); view() failed under torch.compile
++    # ("Cannot view a tensor with shape (4, 8, 512) ...") on GLM-5.3 batch>1.
++    return matmul_op(block_mapping, tensor.reshape(shape[0], -1)).view(-1, *shape[1:])
+ 
+ 
+ def batch2block(tensor, block_mapping, matmul_op=torch.matmul):
+-- 
+2.43.0
+

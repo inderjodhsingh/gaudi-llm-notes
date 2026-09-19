@@ -1,0 +1,70 @@
+From a61871f4bdce7d6d12ab610e23f3d07c8f5b3f94 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 08:34:36 +0000
+Subject: [PATCH] patch 56: Glm5Next spells the image token image_token_id, add
+ it to the proposer allowlist
+
+---
+ vllm/models/glm5next/nvidia/mtp.py       | 19 +++++++++----------
+ vllm/v1/spec_decode/llm_base_proposer.py |  1 +
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/models/glm5next/nvidia/mtp.py b/vllm/models/glm5next/nvidia/mtp.py
+index de70d8a6f..dab6a4860 100644
+--- a/vllm/models/glm5next/nvidia/mtp.py
++++ b/vllm/models/glm5next/nvidia/mtp.py
+@@ -360,9 +360,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                     name = name_mapped
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+-                # Same rule as the plain branch below: HPU builds no DSA indexer, so its stacked
+-                # (wk_weights_proj) target does not exist. Skip rather than KeyError.
+-                if name not in params_dict:
++                # Same rule as the plain branch below, and just as narrow: only the indexer's stacked
++                # (wk_weights_proj) target can legitimately be absent, on HPU.
++                if name not in params_dict and ".indexer." in name:
+                     break
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+@@ -376,7 +376,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         continue
+                     is_expert_weight = True
+                     name_mapped = name.replace(weight_name, param_name)
+-                    if name_mapped not in params_dict:
++                    if name_mapped not in params_dict and ".indexer." in name_mapped:
+                         continue
+                     param = params_dict[name_mapped]
+                     weight_loader = typing.cast(
+@@ -406,12 +406,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         and ".layers" not in name
+                     ):
+                         continue
+-                    # On HPU the DSA/k-pool indexer is not constructed (dense NoPE MLA is exact for
+-                    # ctx <= index_topk), so the checkpoint's indexer tensors have no parameter to load into.
+-                    # The main model's loader already tolerates this; the MTP module's own loader did not, and
+-                    # died on model.layers.<n>.mtp_block.self_attn.indexer.*. Skip what the module does not have,
+-                    # the same rule the main model uses.
+-                    if name not in params_dict:
++                    # On HPU the DSA/k-pool indexer is not constructed (patch 12 forces is_v32=False; dense NoPE
++                    # MLA is exact for ctx <= index_topk), so the checkpoint's indexer tensors have no parameter
++                    # to load into. Skip ONLY those. Anything else missing is a real mismatch and must stay loud:
++                    # a blanket skip would silently drop weights and produce a plausible-looking wrong draft.
++                    if name not in params_dict and ".indexer." in name:
+                         continue
+                     param = params_dict[name]
+                     weight_loader = getattr(
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 0eaba0129..62ebf25b7 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1389,6 +1389,7 @@ class SpecDecodeBaseProposer:
+                 "Qwen3VLMoeForConditionalGeneration",
+                 "Gemma4ForConditionalGeneration",
+                 "Gemma4UnifiedForConditionalGeneration",
++                "Glm5NextForConditionalGeneration",
+                 "Step3p7ForConditionalGeneration",
+             ]:
+                 self.model.config.image_token_index = target_model.config.image_token_id
+-- 
+2.43.0
+

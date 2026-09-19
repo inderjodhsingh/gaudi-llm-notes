@@ -1,0 +1,185 @@
+From 09bdae334cc64ff1d389ee3d9bf9724c5b5bec83 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:48:25 +0000
+Subject: [PATCH] HPU MoE: rebase routing ids to local expert slots before
+ mixture_of_experts
+
+Habana SW 1.24.1 mixture_of_experts indexes w12/w3 by the raw routing id
+and ignores the experts_min offset (ids above experts_max are dropped).
+With EP every rank with experts_min != 0 read wrong/out-of-range experts;
+GLM-5.3-Flash EP=8 layer 3 only had rank 0's experts right (per-rank
+probe: local ids + [0,n-1] match CPU to 3-8%, global ids rel err ~1.0).
+Local ids with [0, n_local-1] are equivalent under the documented
+global-id contract, so this is safe on both behaviours.
+---
+ vllm_gaudi/extension/ops.py | 65 +++++++++++++++++++++++++++----------
+ 1 file changed, 48 insertions(+), 17 deletions(-)
+
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index 85b78bf..987aacd 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -656,6 +656,29 @@ class MoeMatmul(torch.nn.Module):
+         raise NotImplementedError()
+ 
+ 
++
++
++def _localize_routing_ids(routing_ids, experts_min, experts_max, global_num_experts=None):
++    """Rebase global expert ids to this rank's local weight slots.
++
++    Habana SW 1.24.1: ``torch.ops.hpu.mixture_of_experts`` indexes ``w12``/``w3``
++    by the raw routing id and does not subtract ``experts_min`` (ids above
++    ``experts_max`` are dropped). With expert parallelism every rank with
++    ``experts_min != 0`` therefore read the wrong / out-of-range expert slot
++    (GLM-5.3-Flash EP=8: only rank 0's experts were correct). Passing local ids
++    with the range ``[0, n_local-1]`` is equivalent under the documented
++    global-id contract and correct under the observed one. Non-local ids are
++    mapped to ``global_num_experts`` (above any local range) so the kernel
++    drops them.
++    """
++    if experts_min == 0:
++        return routing_ids, experts_min, experts_max
++    n_local = experts_max - experts_min + 1
++    sentinel = max(int(global_num_experts or 0), n_local)
++    keep = (routing_ids >= experts_min) & (routing_ids <= experts_max)
++    local = torch.where(keep, routing_ids - experts_min, torch.full_like(routing_ids, sentinel))
++    return local, 0, n_local - 1
++
+ class VllmMixtureOfExpertsOpBase(torch.nn.Module):
+ 
+     def __init__(self,
+@@ -764,6 +787,8 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+         return ret
+ 
+     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
++        expert_routing_table, emin, emax = _localize_routing_ids(expert_routing_table, self.experts_min, self.experts_max,
++                                                          getattr(self, 'global_num_experts', None))
+         tokens_num, _ = hidden_states.shape
+         activation = _as_activation_str(activation)
+         kwargs = self._get_extra_kwargs(tokens_num) if self.bias is None else None
+@@ -785,8 +810,8 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+                                                                            w12_bias=self._cached_w13_bias_views,
+                                                                            w3_bias=self._cached_w2_bias_views,
+                                                                            permuted_weights=permuted_weights,
+-                                                                           experts_min=self.experts_min,
+-                                                                           experts_max=self.experts_max)
++                                                                           experts_min=emin,
++                                                                           experts_max=emax)
+             else:
+                 return torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
+                                                         expert_routing_table=expert_routing_table,
+@@ -795,8 +820,8 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+                                                         w3=w2_list,
+                                                         permuted_weights=permuted_weights,
+                                                         activation=activation,
+-                                                        experts_min=self.experts_min,
+-                                                        experts_max=self.experts_max,
++                                                        experts_min=emin,
++                                                        experts_max=emax,
+                                                         **kwargs)
+ 
+         if self.bias is not None:
+@@ -819,14 +844,14 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+                     w12_bias=w13_bias_list_slice,
+                     w3_bias=w2_bias_list_slice,
+                     permuted_weights=permuted_weights,
+-                    experts_min=self.experts_min,
+-                    experts_max=self.experts_max)
++                    experts_min=emin,
++                    experts_max=emax)
+             else:
+                 start = i * self.num_expert_per_group
+                 end = (i + 1) * self.num_expert_per_group
+                 w13_list_slice = w13_list[start:end]
+                 w2_list_slice = w2_list[start:end]
+-                min_expert = self.experts_min + start
++                min_expert = emin + start
+                 max_expert = min_expert + self.num_expert_per_group - 1
+ 
+                 slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
+@@ -1303,6 +1328,8 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
++                                                          getattr(self, 'global_num_experts', None))
+         tokens_num, _ = x.shape
+         activation = _as_activation_str(activation)
+         kwargs = self._get_extra_kwargs(tokens_num)
+@@ -1321,13 +1348,13 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
+                                                     w3=w2_list,
+                                                     permuted_weights=permuted_weights,
+                                                     activation=activation,
+-                                                    experts_min=self.experts_min,
+-                                                    experts_max=self.experts_max,
++                                                    experts_min=emin,
++                                                    experts_max=emax,
+                                                     **kwargs)
+         for i in range(self.moe_n_slice):
+             w13_list_slice = w13_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+             w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+-            min_expert = self.experts_min + i * self.num_expert_per_group
++            min_expert = emin + i * self.num_expert_per_group
+             max_expert = min_expert + self.num_expert_per_group - 1
+             slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x,
+                                                                          expert_routing_table=topk_ids,
+@@ -1399,6 +1426,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
++                                                          getattr(self, 'global_num_experts', None))
+         tokens_num, _ = x.shape
+         activation = _as_activation_str(activation)
+         kwargs = self._get_extra_kwargs(tokens_num)
+@@ -1428,8 +1457,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+                                                                    d_scale_w3=w2_weight_scale,
+                                                                    permuted_weights=permuted_weights,
+                                                                    activation=activation,
+-                                                                   experts_min=self.experts_min,
+-                                                                   experts_max=self.experts_max,
++                                                                   experts_min=emin,
++                                                                   experts_max=emax,
+                                                                    **kwargs)
+         else:
+             x_scale = self.w13_input_scale.data
+@@ -1447,8 +1476,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+                                                                    d_scale_w3=w2_weight_scale,
+                                                                    permuted_weights=permuted_weights,
+                                                                    activation=activation,
+-                                                                   experts_min=self.experts_min,
+-                                                                   experts_max=self.experts_max,
++                                                                   experts_min=emin,
++                                                                   experts_max=emax,
+                                                                    **kwargs)
+ 
+         return final_hidden_states
+@@ -1615,6 +1644,8 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
+         permuted_weights=True,
+         activation="silu",
+     ):
++        topk_ids, emin, emax = _localize_routing_ids(topk_ids, self.experts_min, self.experts_max,
++                                                          getattr(self, 'global_num_experts', None))
+         activation = _as_activation_str(activation)
+         w13_list = []
+         w2_list = []
+@@ -1631,12 +1662,12 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
+                                                     w3=w2_list,
+                                                     permuted_weights=permuted_weights,
+                                                     activation=activation,
+-                                                    experts_min=self.experts_min,
+-                                                    experts_max=self.experts_max)
++                                                    experts_min=emin,
++                                                    experts_max=emax)
+         for i in range(self.moe_n_slice):
+             w13_list_slice = w13_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+             w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+-            min_expert = self.experts_min + i * self.num_expert_per_group
++            min_expert = emin + i * self.num_expert_per_group
+             max_expert = min_expert + self.num_expert_per_group - 1
+             slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                 hidden_states=x,
+-- 
+2.43.0
+

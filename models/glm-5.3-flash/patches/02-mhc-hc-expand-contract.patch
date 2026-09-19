@@ -1,0 +1,31 @@
+From b53566c00f28d808940128e1966cd7d7f73bc1e3 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 04:17:08 +0000
+Subject: [PATCH] add hc_expand/hc_contract to mhc.py for glm5next (from
+ 933876c)
+
+---
+ vllm/model_executor/layers/mhc.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/vllm/model_executor/layers/mhc.py b/vllm/model_executor/layers/mhc.py
+index 8f1c22f16..c3b84cf3b 100644
+--- a/vllm/model_executor/layers/mhc.py
++++ b/vllm/model_executor/layers/mhc.py
+@@ -577,3 +577,13 @@ class MHCFusedPostPreOp(CustomOp):
+             hc_post_mult_value,
+             sinkhorn_repeat,
+         )
++
++
++def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
++    """[s, hidden_size] -> [s, n, hidden_size] by replication. From 933876c."""
++    return x.unsqueeze(1).expand(-1, n, -1).contiguous()
++
++
++def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
++    """[s, n, hidden_size] -> [s, hidden_size] by averaging. From 933876c."""
++    return x.mean(dim=1)
+-- 
+2.43.0
+

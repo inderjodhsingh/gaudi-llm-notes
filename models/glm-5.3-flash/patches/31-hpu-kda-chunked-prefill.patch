@@ -1,0 +1,192 @@
+From 0dcae1bbfb30160084611ea471f92306453788ac Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 21:16:33 +0000
+Subject: [PATCH] HPU KDA: real chunked prefill (chunk 64) instead of
+ token-by-token recurrent
+
+hpu_chunk_kda was a wrapper over the dynamo-disabled per-token recurrent
+loop: 1058 ms per layer for 1024 tokens (~30 ms/token prefill end to end).
+Port of HF chunk_kimi_delta_attention (F32): per-chunk-group compiled
+intra/inter kernels inside a dynamo-disabled loop (bounded memory, static
+shapes), batched triangular solve. State transposed to the HPU [v,k]
+layout. vs recurrent kernel: out rel 3e-5, state 1e-6, pads no-op;
+5.3 ms/layer @1024, 13.6 ms @4096 (scripts/test_kda_chunk.py).
+---
+ vllm_gaudi/ops/hpu_kda_pytorch.py | 151 +++++++++++++++++++++++++-----
+ 1 file changed, 128 insertions(+), 23 deletions(-)
+
+diff --git a/vllm_gaudi/ops/hpu_kda_pytorch.py b/vllm_gaudi/ops/hpu_kda_pytorch.py
+index 0a0e95e..d363ebb 100644
+--- a/vllm_gaudi/ops/hpu_kda_pytorch.py
++++ b/vllm_gaudi/ops/hpu_kda_pytorch.py
+@@ -161,6 +161,118 @@ def _kda_recurrent_time_loop(
+     return outs, final_state
+ 
+ 
++_CHUNK_STEP_CACHE: dict = {}
++
++
++def _compiled(fn):
++    """torch.compile a static-shape HPU kernel once per function object."""
++    key = fn.__name__
++    if key not in _CHUNK_STEP_CACHE:
++        _CHUNK_STEP_CACHE[key] = torch.compile(fn, backend="hpu_backend", dynamic=False)
++    return _CHUNK_STEP_CACHE[key]
++
++
++def _kda_chunk_intra(k, k_beta, g):
++    """Per-chunk-group intra-chunk matrices. k/k_beta/g: [S, H, G, C, D] (g = in-chunk cumsum).
++
++    Returns attn [S, H, G, C, C] = -sum_d k_beta[i,d] k[j,d] exp(g[i,d]-g[j,d]) for i > j (0 else),
++    i.e. the strictly-lower part before the triangular solve (HF chunk_kimi_delta_attention).
++    """
++    C = k.shape[-2]
++    mask = torch.triu(torch.ones(C, C, dtype=torch.bool, device=k.device), diagonal=0)
++    decay = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp()  # [S,H,G,C(i),C(j),D]
++    attn = -(k_beta.unsqueeze(-2) * k.unsqueeze(-3) * decay).sum(dim=-1)
++    return attn.masked_fill(mask, 0.0)
++
++
++def _kda_chunk_solve(attn, v_beta, k_beta, g):
++    """Batched forward substitution over all chunks: (I + A)^-1 style as in HF.
++    attn [S,H,n,C,C]; v_beta/k_beta/g [S,H,n,C,D]. Returns (v_new_intra, k_cumdecay)."""
++    C = attn.shape[-1]
++    for i in range(1, C):
++        row = attn[..., i, :i].clone()
++        sub = attn[..., :i, :i].clone()
++        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
++    attn = attn + torch.eye(C, dtype=attn.dtype, device=attn.device)
++    value = attn @ v_beta
++    k_cumdecay = attn @ (k_beta * g.exp())
++    return value, k_cumdecay
++
++
++def _kda_chunk_inter(q, k, value, g, k_cumdecay, state):
++    """Per-chunk-group inter-chunk recurrence. q/k/value/g/k_cumdecay: [S,H,G,C,D]; state [S,H,D,D].
++    Returns (out [S,H,G,C,D], new state)."""
++    C = q.shape[-2]
++    G = q.shape[2]
++    mask = torch.triu(torch.ones(C, C, dtype=torch.bool, device=q.device), diagonal=1)
++    outs = []
++    for i in range(G):
++        q_i, k_i, v_i, g_i = q[:, :, i], k[:, :, i], value[:, :, i], g[:, :, i]
++        decay = (g_i.unsqueeze(-2) - g_i.unsqueeze(-3)).exp()
++        attn_inter = (q_i * g_i.exp()) @ state
++        attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay).sum(dim=-1).masked_fill(mask, 0.0)
++        v_prime = k_cumdecay[:, :, i] @ state
++        v_new = v_i - v_prime
++        outs.append(attn_inter + attn_intra @ v_new)
++        state = (state * g_i[:, :, -1].exp().unsqueeze(-1)
++                 + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new)
++    return torch.stack(outs, dim=2), state
++
++
++@torch._dynamo.disable
++def _kda_chunk_prefill(q, k, v, g, beta, initial_state, chunk_size, use_qk_l2norm, scale, group):
++    """Chunked KDA prefill (HF chunk_kimi_delta_attention algorithm), F32.
++    q/k/v/g: [S, L, H, D]; beta: [S, L, H]; initial_state: [S, H, D, D] or None.
++    Runs outside the outer compiled graph; the pieces are static-shape compiled kernels."""
++    S, L, H, D = q.shape
++    C = chunk_size
++    qf, kf, vf, gf = [x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, g)]
++    bf = beta.transpose(1, 2).contiguous().to(torch.float32)  # [S,H,L]
++    if use_qk_l2norm:
++        qf = _l2norm_last_dim(qf)
++        kf = _l2norm_last_dim(kf)
++    qf = qf * scale
++    pad = (C - L % C) % C
++    if pad:
++        qf = torch.nn.functional.pad(qf, (0, 0, 0, pad))
++        kf = torch.nn.functional.pad(kf, (0, 0, 0, pad))
++        vf = torch.nn.functional.pad(vf, (0, 0, 0, pad))
++        gf = torch.nn.functional.pad(gf, (0, 0, 0, pad))
++        bf = torch.nn.functional.pad(bf, (0, pad))
++    Lp = L + pad
++    n = Lp // C
++    qf, kf, vf, gf = [x.reshape(S, H, n, C, D) for x in (qf, kf, vf, gf)]
++    bf = bf.reshape(S, H, n, C)
++    gf = gf.cumsum(dim=-2)
++    v_beta = vf * bf.unsqueeze(-1)
++    k_beta = kf * bf.unsqueeze(-1)
++    # group chunks so each compiled step has a fixed [S,H,G,C,D] shape (pad n to a multiple of G)
++    G = max(1, min(group, n))
++    npad = (G - n % G) % G
++    if npad:
++        z = lambda x: torch.nn.functional.pad(x, (0, 0, 0, 0, 0, npad))  # noqa: E731
++        qf, kf, vf, gf, v_beta, k_beta = [z(x) for x in (qf, kf, vf, gf, v_beta, k_beta)]
++    ng = (n + npad) // G
++    intra = _compiled(_kda_chunk_intra)
++    attn_parts = [intra(kf[:, :, i * G:(i + 1) * G], k_beta[:, :, i * G:(i + 1) * G], gf[:, :, i * G:(i + 1) * G])
++                  for i in range(ng)]
++    attn = torch.cat(attn_parts, dim=2)  # [S,H,n+npad,C,C]
++    value, k_cumdecay = _compiled(_kda_chunk_solve)(attn, v_beta, k_beta, gf)
++    # HF chunk algorithm keeps the state as [k, v]; the HPU recurrent kernel / ssm cache
++    # keep [v, k] (state[h, v_idx, k_idx]). Transpose on the way in and out.
++    state = (torch.zeros(S, H, D, D, dtype=torch.float32, device=q.device)
++             if initial_state is None
++             else initial_state.to(torch.float32).reshape(S, H, D, D).transpose(-1, -2).contiguous())
++    inter = _compiled(_kda_chunk_inter)
++    outs = []
++    for i in range(ng):
++        sl = slice(i * G, (i + 1) * G)
++        o, state = inter(qf[:, :, sl], kf[:, :, sl], value[:, :, sl], gf[:, :, sl], k_cumdecay[:, :, sl], state)
++        outs.append(o)
++    out = torch.cat(outs, dim=2).reshape(S, H, (n + npad) * C, D)[:, :, :L]
++    return out.transpose(1, 2).contiguous().to(q.dtype), state.transpose(-1, -2).contiguous()
++
++
+ def hpu_chunk_kda(
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -173,32 +285,25 @@ def hpu_chunk_kda(
+     chunk_size: int = 64,
+     prefill_num_seqs: int | None = None,
+     prefill_seq_len: int | None = None,
++    chunk_group: int = 4,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+-    """Prefill KDA. Static-shape buckets: reshape to [S, L, H, D] then recurrent.
++    """Chunked KDA prefill (chunk 64). q/k/v/g: [B, T, H, D], beta: [B, T, H].
+ 
+-    Token loop is dynamo-disabled (graph_break, PLE lesson). Chunk_size is
+-    accepted for API parity with GDN; the exact recurrent is the Gate-2 oracle.
++    With prefill_num_seqs/prefill_seq_len the flat [1, S*L] batch is viewed as
++    S sequences of L tokens (bucketed, pads are no-ops: q=k=v=0, g=0, beta=0).
++    initial_state: [S, H, D, D] (or None). Returns out [B, T, H, D] and the
++    final state [S, H, D, D]. Replaces the token-by-token recurrent wrapper
++    (30 ms/token prefill).
+     """
+     B, T, H, D = q.shape
+     if prefill_num_seqs is not None and prefill_seq_len is not None and prefill_num_seqs > 0:
+         S, L = prefill_num_seqs, prefill_seq_len
+-        q = q.reshape(S, L, H, D)
+-        k = k.reshape(S, L, H, D)
+-        v = v.reshape(S, L, H, D)
+-        g = g.reshape(S, L, H, D)
+-        beta = beta.reshape(S, L, H)
+-        out, st = hpu_fused_recurrent_kda(
+-            q, k, v, g, beta,
+-            initial_state=initial_state,
+-            inplace_final_state=True,
+-            ssm_state_indices=torch.arange(S, device=q.device),
+-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+-        )
+-        return out.reshape(B, T, H, D), st if output_final_state else None
+-    out, st = hpu_fused_recurrent_kda(
+-        q, k, v, g, beta,
+-        initial_state=initial_state,
+-        inplace_final_state=True,
+-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+-    )
+-    return out, st if output_final_state else None
++    else:
++        S, L = B, T
++    out, st = _kda_chunk_prefill(
++        q.reshape(S, L, H, D), k.reshape(S, L, H, D), v.reshape(S, L, H, D), g.reshape(S, L, H, D),
++        beta.reshape(S, L, H), initial_state, chunk_size, use_qk_l2norm_in_kernel, D ** -0.5, chunk_group)
++    if initial_state is not None and initial_state.shape == st.shape:
++        initial_state.copy_(st.to(initial_state.dtype))  # keep in-place semantics of the recurrent path
++        st = initial_state
++    return out.reshape(B, T, H, D), st if output_final_state else None
+-- 
+2.43.0
+

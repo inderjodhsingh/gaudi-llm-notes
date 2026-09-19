@@ -1,0 +1,124 @@
+From b14e7c220ebe6052455d86ec2b9b21469290561c Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 11:54:10 +0000
+Subject: [PATCH] HPU MLA NoPE: skip empty rope concat/split in prefill and
+ decode
+
+---
+ vllm_gaudi/attention/backends/hpu_attn.py | 34 +++++++++++++++++------
+ vllm_gaudi/attention/oot_mla.py           | 15 ++++++++--
+ 2 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/vllm_gaudi/attention/backends/hpu_attn.py b/vllm_gaudi/attention/backends/hpu_attn.py
+index 60ca2fe..5046923 100644
+--- a/vllm_gaudi/attention/backends/hpu_attn.py
++++ b/vllm_gaudi/attention/backends/hpu_attn.py
+@@ -277,15 +277,23 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+             latent_vec_k = current
+         # =========================== #
+ 
+-        k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
++        if self.qk_rope_head_dim == 0:
++            k_c_normed = latent_vec_k
++            k_pe = None
++        else:
++            k_c_normed, k_pe = latent_vec_k.split(
++                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
++            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+ 
+         kv_nope = self.kv_b_proj(k_c_normed)[0]\
+             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+         k_nope, v = kv_nope\
+             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+ 
+-        k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
++        if k_pe is None or self.qk_rope_head_dim == 0:
++            k = k_nope
++        else:
++            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+ 
+         if not self.use_merged_prefill:
+             assert attn_metadata.seq_lens_tensor is not None, \
+@@ -332,7 +340,10 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+                 HPUPagedAttention.split_kv_cache(k_cache, self.num_kv_heads, self.head_size)
+         if isinstance(k_cache, tuple):
+             k_cache = k_cache[0]  # Use only key_cache for MLA
+-        query = torch.cat([q_nope, q_pe], dim=-1)
++        if q_pe is None or q_pe.shape[-1] == 0:
++            query = q_nope
++        else:
++            query = torch.cat([q_nope, q_pe], dim=-1)
+         key_cache = k_cache.unsqueeze(1) if k_cache is not None else None
+         value_cache = None
+         output = HPUPagedAttention.forward_decode(query=query,
+@@ -539,22 +550,29 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
+             )
+         # Set return shape
+         output_shape = query.shape
++        slot_mapping_early = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
+         if query.dim() == 2:
+-            if attn_metadata.seq_lens_tensor is not None:
++            num_tokens, hidden_size = query.shape
++            # Spec-decode flatten [B, k+1] → [B*(k+1), 1]: one slot per row, decode not prompt.
++            spec_flat = (not attn_metadata.is_prompt and slot_mapping_early is not None
++                         and slot_mapping_early.numel() == num_tokens)
++            if spec_flat:
++                batch_size, seq_len = num_tokens, 1
++            elif attn_metadata.seq_lens_tensor is not None:
+                 batch_size = attn_metadata.seq_lens_tensor.shape[0] if not self.use_merged_prefill else 1
++                seq_len = num_tokens // batch_size
+             else:
+                 assert attn_metadata.block_mapping is not None, \
+                     "seq_lens_tensor must be provided for attention"
+                 batch_size = attn_metadata.block_mapping.shape[1]
+-            num_tokens, hidden_size = query.shape
+-            seq_len = num_tokens // batch_size
++                seq_len = num_tokens // batch_size
+             query = query.view(batch_size, seq_len, -1)
+         else:
+             batch_size, seq_len, hidden_size = query.shape
+ 
+         key = key.view(-1, self.num_kv_heads, self.head_size)
+         value = value.view(-1, self.num_kv_heads, self.head_size)
+-        slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
++        slot_mapping = slot_mapping_early
+         key_cache = None
+         value_cache = None
+         k_scales = None
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index 788df63..07ee510 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -143,8 +143,11 @@ class HPUMLAAttention(MLAAttention):
+         is_prefill = attn_metadata.is_prompt
+ 
+         if not is_prefill:
+-            # decode
+-            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
++            # decode. NoPE (qk_rope_head_dim=0): skip empty rope split.
++            if self.qk_rope_head_dim == 0:
++                q_nope, q_pe = q, q.new_zeros(*q.shape[:-1], 0)
++            else:
++                q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+             # Convert from (B, N, P) to (N, B, P)
+             q_nope = q_nope.transpose(0, 1)
+             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+@@ -154,7 +157,13 @@ class HPUMLAAttention(MLAAttention):
+ 
+         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
+ 
+-        latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
++        if self.qk_rope_head_dim == 0:
++            latent_vec_k = k_c_normed
++        else:
++            latent_vec_k = torch.concat(
++                (k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)),
++                dim=-1,
++            )
+         latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
+ 
+         # write the latent and rope to kv cache
+-- 
+2.43.0
+

@@ -1,0 +1,58 @@
+From d4c531df97982d9be2b6a5bdcdbab00211ff989d Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 18:30:53 +0000
+Subject: [PATCH] GLM5 MLA attention: build the vllm-gaudi k-pool indexer on
+ HPU when VLLM_HPU_DSA_SPARSE is set
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/nvidia/attention.py | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 2b54efe02..890fcfc63 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -518,8 +520,21 @@ class Glm5NextMLAAttention(nn.Module):
+         self.is_v32 = getattr(config, "index_topk", None) is not None
+         # Phase 3a: HPU has no DSA/kpool. Run the 11 sparse layers as dense NoPE
+         # MLA (exact for ctx <= index_topk). Do not construct the CUDA indexer.
++        hpu_indexer = None
+         if getattr(current_platform, "device_type", None) == "hpu":
+             self.is_v32 = False
++            # Phase 3b: torch-native k-pool indexer (vllm-gaudi), opt-in via VLLM_HPU_DSA_SPARSE.
++            # Parameter names match the checkpoint (`<prefix>.indexer.wq_b.weight`, ...), so the
++            # generic weight loader fills it; the HPU MLA wrapper drives it.
++            if getattr(config, "index_topk", None) is not None and os.environ.get(
++                "VLLM_HPU_DSA_SPARSE", "").lower() in ("1", "true", "yes"):
++                from vllm_gaudi.ops.hpu_dsa_indexer import HPUKpoolIndexer
++
++                assert q_lora_rank is not None
++                assert getattr(config, "index_kpool_compress", True) and getattr(
++                    config, "index_kpool_always_select_tail", True), "only the k-pool compress+tail variant is ported"
++                hpu_indexer = HPUKpoolIndexer(hidden_size, q_lora_rank, config.index_n_heads, config.index_head_dim,
++                                              config.index_kpool, config.index_topk)
+ 
+         _skip_topk = False
+         if self.is_v32:
+@@ -564,7 +579,7 @@ class Glm5NextMLAAttention(nn.Module):
+ 
+         else:
+             self.indexer_rope_emb = None
+-            self.indexer = None
++            self.indexer = hpu_indexer
+ 
+         mla_modules = MLAModules(
+             kv_a_layernorm=self.kv_a_layernorm,
+-- 
+2.43.0
+

@@ -1,0 +1,25 @@
+From c8244f5e7c339d0bec59bd4b881928234b07b16a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 12:09:53 +0000
+Subject: [PATCH] detect HPU via device_type==hpu (is_hpu is not on Platform)
+
+---
+ vllm/models/glm5next/nvidia/attention.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 6dcaa0e4b..2b54efe02 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -518,7 +518,7 @@ class Glm5NextMLAAttention(nn.Module):
+         self.is_v32 = getattr(config, "index_topk", None) is not None
+         # Phase 3a: HPU has no DSA/kpool. Run the 11 sparse layers as dense NoPE
+         # MLA (exact for ctx <= index_topk). Do not construct the CUDA indexer.
+-        if current_platform.is_hpu():
++        if getattr(current_platform, "device_type", None) == "hpu":
+             self.is_v32 = False
+ 
+         _skip_topk = False
+-- 
+2.43.0
+

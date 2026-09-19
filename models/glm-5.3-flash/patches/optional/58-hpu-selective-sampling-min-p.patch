@@ -1,0 +1,42 @@
+From 16663ae1f80145d6ca085ebd8e7fb6d7ee1cb478 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 15:44:35 +0000
+Subject: [PATCH] patch 58: copy min_p on the selective sampling-metadata path
+ and include it in the cache guard
+
+---
+ vllm_gaudi/v1/worker/hpu_input_batch.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_input_batch.py b/vllm_gaudi/v1/worker/hpu_input_batch.py
+index 3c607cf..c24cbfa 100644
+--- a/vllm_gaudi/v1/worker/hpu_input_batch.py
++++ b/vllm_gaudi/v1/worker/hpu_input_batch.py
+@@ -647,6 +647,12 @@ class InputBatch:
+             async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices)
+             async_h2d_update(self.top_p_cpu_tensor, self.top_p, req_indices)
+             async_h2d_update(self.top_k_cpu_tensor, self.top_k, req_indices)
++            # min_p was missing here while the full refresh_sampling_metadata path copies it. On the selective
++            # path a request that sets min_p therefore sampled against whatever value the previous occupant of
++            # its slot had left on the device -- the same stale-per-slot family as the bug patch 45 fixed for
++            # max_num_logprobs and all_greedy.
++            if not self.no_min_p:
++                async_h2d_update(self.min_p_cpu_tensor, self.min_p, req_indices)
+             if not self.no_penalties:
+                 # Since syncing these tensors is expensive only copy them
+                 # if necessary i.e. if there are requests which require
+@@ -680,8 +686,10 @@ class InputBatch:
+         cache_key = (tuple(req_indices), tuple(rid for rid, _ in req_id_output_token_ids), self.max_num_logprobs,
+                      self.all_greedy, self.all_random)
+         cache = getattr(self, "_selective_md_cache", None)
++        # no_min_p belongs in this guard for the same reason: a cached SamplingMetadata reused across batches
++        # would carry the previous batch's min_p tensor.
+         if cache is not None and cache[0] == cache_key and self.no_penalties \
+-                and self.no_allowed_token_ids:
++                and self.no_allowed_token_ids and self.no_min_p:
+             import dataclasses
+             return dataclasses.replace(cache[1], output_token_ids=[toks for _, toks in req_id_output_token_ids])
+ 
+-- 
+2.43.0
+

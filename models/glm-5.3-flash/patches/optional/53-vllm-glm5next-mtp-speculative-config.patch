@@ -1,0 +1,68 @@
+From d1d4cc72e0f4b968b78ef64cf858536193f0b8d7 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 04:42:13 +0000
+Subject: [PATCH] patch 55: MTP loader skips weights with no parameter (HPU
+ builds no DSA indexer)
+
+---
+ vllm/config/speculative.py         |  5 +++++
+ vllm/models/glm5next/nvidia/mtp.py | 13 +++++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index a68a663f8..44d3eb31f 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -859,6 +859,11 @@ class SpeculativeConfig:
+                 for _k, _v in vars(text_config).items():
+                     if not _k.startswith("_") and not hasattr(hf_config, _k):
+                         setattr(hf_config, _k, _v)
++            # The draft ModelConfig is built fresh and does not inherit --language-model-only, so the multimodal
++            # plumbing still runs over it and asks for the `image_token_index` alias that Glm5NextConfig spells
++            # `image_token_id`. Provide the alias rather than carrying the vision tower into the draft.
++            if not hasattr(hf_config, "image_token_index") and hasattr(hf_config, "image_token_id"):
++                hf_config.image_token_index = hf_config.image_token_id
+             hf_config.update(
+                 {
+                     "hc_mult": int(getattr(text_config, "hc_mult", 1)),
+diff --git a/vllm/models/glm5next/nvidia/mtp.py b/vllm/models/glm5next/nvidia/mtp.py
+index 20c3ac8c3..de70d8a6f 100644
+--- a/vllm/models/glm5next/nvidia/mtp.py
++++ b/vllm/models/glm5next/nvidia/mtp.py
+@@ -360,6 +360,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                     name = name_mapped
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
++                # Same rule as the plain branch below: HPU builds no DSA indexer, so its stacked
++                # (wk_weights_proj) target does not exist. Skip rather than KeyError.
++                if name not in params_dict:
++                    break
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
+@@ -372,6 +376,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         continue
+                     is_expert_weight = True
+                     name_mapped = name.replace(weight_name, param_name)
++                    if name_mapped not in params_dict:
++                        continue
+                     param = params_dict[name_mapped]
+                     weight_loader = typing.cast(
+                         Callable[..., bool], param.weight_loader
+@@ -400,6 +406,13 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         and ".layers" not in name
+                     ):
+                         continue
++                    # On HPU the DSA/k-pool indexer is not constructed (dense NoPE MLA is exact for
++                    # ctx <= index_topk), so the checkpoint's indexer tensors have no parameter to load into.
++                    # The main model's loader already tolerates this; the MTP module's own loader did not, and
++                    # died on model.layers.<n>.mtp_block.self_attn.indexer.*. Skip what the module does not have,
++                    # the same rule the main model uses.
++                    if name not in params_dict:
++                        continue
+                     param = params_dict[name]
+                     weight_loader = getattr(
+                         param, "weight_loader", default_weight_loader
+-- 
+2.43.0
+

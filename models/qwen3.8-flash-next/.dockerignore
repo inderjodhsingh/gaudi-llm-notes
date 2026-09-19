@@ -1,0 +1,6 @@
+*
+!patches/
+!patches/*.patch
+!docker/
+!docker/Dockerfile
+!docker/constraints.txt

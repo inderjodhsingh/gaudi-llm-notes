@@ -1,0 +1,98 @@
+From 269d06565586fe55f21a9155035a1f536f0857e4 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 06:50:08 +0000
+Subject: [PATCH 1/2] HPU runner: size dynamo accumulated_cache_size_limit by
+ layers x buckets
+
+Regional compilation gives every decoder layer instance its own guard
+entries on one shared code object; 45 layers x 27 buckets exceeded the
+old 8x limit (1088) and dynamo silently ran later variants eagerly
+(GLM-5.3 post-warmup prefill 14-20 s vs ~1 s compiled).
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index f586321..636421b 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -6481,13 +6481,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+ 
+         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
+             multiplier = 5 if self.compile_config.regional_compilation else 1
+-            cache_size_limit = 1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
+-                                                 len(self.bucketing_manager.decode_buckets))
++            num_buckets = (len(self.bucketing_manager.prompt_buckets) + len(self.bucketing_manager.decode_buckets))
++            cache_size_limit = 1 + multiplier * num_buckets
+             torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
+-            # Multiply by 8 to follow the original default ratio between
+-            # the cache_size_limit and accumulated_cache_size_limit
+-            torch._dynamo.config.accumulated_cache_size_limit = max(cache_size_limit * 8,
++            # accumulated_cache_size_limit bounds the TOTAL entries of one code
++            # object across all id-matched instances. With regional compilation
++            # every decoder layer instance shares Glm5NextDecoderLayer.forward,
++            # so the total is layers x buckets (GLM-5.3: 45 x 27 = 1215 > the old
++            # 8x = 1088). Beyond it dynamo silently ran the remaining variants
++            # eagerly (post-warmup prefill 14-20 s instead of ~1 s). Size it from
++            # the layer count with headroom for resume-frame variants.
++            num_layers = int(getattr(getattr(self.model_config, "hf_text_config", None) or self.model_config.hf_config,
++                                     "num_hidden_layers", 64) or 64)
++            accumulated = max(cache_size_limit * 8, cache_size_limit * (num_layers + 8) * 2)
++            torch._dynamo.config.accumulated_cache_size_limit = max(accumulated,
+                                                                     torch._dynamo.config.accumulated_cache_size_limit)
++            logger.info("dynamo cache limits: cache_size_limit=%d accumulated=%d (layers=%d buckets=%d)",
++                        torch._dynamo.config.cache_size_limit, torch._dynamo.config.accumulated_cache_size_limit,
++                        num_layers, num_buckets)
+ 
+         if self.skip_warmup:
+             logger.info("Skipping warmup...")
+-- 
+2.43.0
+
+
+From 02085112d546fefe5dde53288dcc23c4c7fb30e5 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 07:31:42 +0000
+Subject: [PATCH 2/2] HPU runner: raise the per-code-object dynamo recompile
+ limit by layers x buckets
+
+torch._dynamo.config.cache_size_limit aliases recompile_limit (per code
+object); with regional compilation all decoder-layer instances share one
+forward code object. In-worker counters showed 'recompile limit exceeded
+(136)' after warmup (45 layers x 27 buckets) and dynamo ran those layers
+eagerly.
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 636421b..91c5f1d 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -6483,6 +6483,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             multiplier = 5 if self.compile_config.regional_compilation else 1
+             num_buckets = (len(self.bucketing_manager.prompt_buckets) + len(self.bucketing_manager.decode_buckets))
+             cache_size_limit = 1 + multiplier * num_buckets
++            # cache_size_limit aliases recompile_limit: the per-code-object cap.
++            # Regional compilation compiles every decoder layer INSTANCE, but they
++            # all share one forward code object, so the cap must cover
++            # layers x buckets (GLM-5.3: 45 x 27); at 136 dynamo reported
++            # "recompile limit exceeded" and ran those layers eagerly.
++            num_layers = int(getattr(getattr(self.model_config, "hf_text_config", None) or self.model_config.hf_config,
++                                     "num_hidden_layers", 64) or 64)
++            cache_size_limit = max(cache_size_limit, (1 + multiplier * num_buckets) * (num_layers + 8) // 4)
+             torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
+             # accumulated_cache_size_limit bounds the TOTAL entries of one code
+             # object across all id-matched instances. With regional compilation
+@@ -6491,8 +6499,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             # 8x = 1088). Beyond it dynamo silently ran the remaining variants
+             # eagerly (post-warmup prefill 14-20 s instead of ~1 s). Size it from
+             # the layer count with headroom for resume-frame variants.
+-            num_layers = int(getattr(getattr(self.model_config, "hf_text_config", None) or self.model_config.hf_config,
+-                                     "num_hidden_layers", 64) or 64)
+             accumulated = max(cache_size_limit * 8, cache_size_limit * (num_layers + 8) * 2)
+             torch._dynamo.config.accumulated_cache_size_limit = max(accumulated,
+                                                                     torch._dynamo.config.accumulated_cache_size_limit)
+-- 
+2.43.0
+

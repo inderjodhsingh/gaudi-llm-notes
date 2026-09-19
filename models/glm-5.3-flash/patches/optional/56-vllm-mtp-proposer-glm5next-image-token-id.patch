@@ -1,0 +1,25 @@
+From ab5b3b1b085cf41238df5bb4167388663c43cd34 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 08:34:36 +0000
+Subject: [PATCH] patch 56: Glm5Next spells the image token image_token_id, add
+ it to the proposer allowlist
+
+---
+ vllm/v1/spec_decode/llm_base_proposer.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 0eaba0129..62ebf25b7 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1389,6 +1389,7 @@ class SpecDecodeBaseProposer:
+                 "Qwen3VLMoeForConditionalGeneration",
+                 "Gemma4ForConditionalGeneration",
+                 "Gemma4UnifiedForConditionalGeneration",
++                "Glm5NextForConditionalGeneration",
+                 "Step3p7ForConditionalGeneration",
+             ]:
+                 self.model.config.image_token_index = target_model.config.image_token_id
+-- 
+2.43.0
+

@@ -1,0 +1,7 @@
+*
+!patches/
+!patches/*.patch
+!docker/
+!docker/Dockerfile.glm53
+!docker/apply_patches.sh
+!docker/constraints-glm53.txt

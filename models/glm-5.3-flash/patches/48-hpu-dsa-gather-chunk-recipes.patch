@@ -1,0 +1,190 @@
+From 231ff8cccfb166ce465e5fa6d9e8007ecf9a4f56 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 14:35:11 +0000
+Subject: [PATCH] HPU DSA gather prefill: run the chunk loop outside the layer
+ graph, one compiled recipe per chunk
+
+Unrolled into the regional decoder-layer graph, the 30 chunks' gathered latents (~2 GiB each) were all held by
+Synapse and warmup failed with 'Failed to allocate DRAM tensors'. The loop is now dynamo-disabled (KDA chunked
+prefill precedent) and calls a static-shape compiled dsa_prefill_chunk kernel on 512-row blocks built from row
+tensors, so no per-chunk recompiles; one-card 32k: 0.48 s per layer, device peak +3.7 GiB.
+
+---
+ vllm_gaudi/attention/oot_mla.py   | 34 +++++++++-------
+ vllm_gaudi/ops/hpu_dsa_indexer.py | 65 ++++++++++++++++++++++++-------
+ 2 files changed, 73 insertions(+), 26 deletions(-)
+
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index a0a3123..c612e46 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -16,8 +16,8 @@ from vllm_gaudi.attention.backends.hpu_attn import HPUMLAMetadata
+ import vllm_gaudi.extension.kernels as kernels
+ from vllm.forward_context import ForwardContext, get_forward_context
+ from vllm_gaudi.extension.runtime import get_config
+-from vllm_gaudi.ops.hpu_dsa_indexer import (HPUKpoolIndexer, decode_select_slots, latent_decode_attention,
+-                                            latent_gather_attention, pool_keys, prefill_select_tokens)
++from vllm_gaudi.ops.hpu_dsa_indexer import (HPUKpoolIndexer, compiled_on, decode_select_slots, dsa_prefill_chunk,
++                                            latent_decode_attention, pool_keys)
+ 
+ 
+ class _DummyPrefillBackend:
+@@ -217,14 +217,20 @@ class HPUMLAAttention(MLAAttention):
+             output = self._v_up_proj(output)
+             return output
+ 
+-    _DSA_PREFILL_CHUNK = 1024
++    _DSA_PREFILL_CHUNK = 512
++    _DSA_SYNC_EVERY = 8
+ 
++    @torch._dynamo.disable
+     def _dsa_sparse_prefill_rows(self, dense_out, q, latent_vec_k, attn_metadata, sparse):
+         """Top-k KV gather for prefill rows whose visible prefix exceeds topk + kpool - 1 tokens.
+ 
+         Rows [0, topk + kpool - 1) keep the dense kernel output unchanged (sparse selection covers their whole prefix,
+-        and slicing the fused SDPA call is not bit-identical), later rows are recomputed from the 2051 selected
++        and slicing the fused SDPA call is not bit-identical); later rows are recomputed from the 2051 selected
+         latents per query in MLA latent space; no L x L mask or bias is built.
++
++        Runs outside the regional decoder-layer graph (like the KDA chunked prefill): unrolled into one graph, the
++        per-chunk gathered latents (~1-2 GiB each) were all held by Synapse and warmup ran out of device memory.
++        Each chunk is its own static-shape compiled recipe, so its workspace is released before the next.
+         """
+         ind = self.kpool_indexer
+         assert ind is not None and self.indexer_cache is not None, "DSA sparse: indexer cache not allocated"
+@@ -237,19 +243,21 @@ class HPUMLAAttention(MLAAttention):
+         qi, kg, wi = sparse
+         heads = self.num_heads
+         q4 = q.view(bsz, length, heads, self.qk_head_dim)
+-        lat = latent_vec_k.view(bsz, length, self.kv_lora_rank)
++        lat = latent_vec_k.reshape(bsz, length, self.kv_lora_rank)
+         qi4 = qi.view(bsz, length, ind.n_heads, ind.head_dim)
+         wi3 = wi.view(bsz, length, ind.n_heads)
+         pk = pool_keys(kg.view(bsz, length, -1), ind.index_kpool_compress_ape, ind.kpool)
+-        pieces = []
+-        for r0 in range(exact, length, self._DSA_PREFILL_CHUNK):
++        chunk_fn = compiled_on(dsa_prefill_chunk, q.device.type)
++        positions = torch.arange(length, device=q.device)
++        pieces = [dense_out.view(bsz, length, -1)[:, :exact]]
++        for n, r0 in enumerate(range(exact, length, self._DSA_PREFILL_CHUNK)):
+             r1 = min(r0 + self._DSA_PREFILL_CHUNK, length)
+-            idx, valid = prefill_select_tokens(qi4, pk, wi3, ind.softmax_scale, ind.topk_tokens, ind.kpool, r0, r1)
+-            q_lat = torch.einsum("bchp,hpr->bchr", q4[:, r0:r1], self.W_UK_T)
+-            o = latent_gather_attention(q_lat, lat, idx, valid, self.scale)
+-            pieces.append(self._v_up_proj(o.reshape(-1, heads, self.kv_lora_rank)).view(bsz, r1 - r0, -1))
+-        dense_rows = dense_out.view(bsz, length, -1)[:, :exact]
+-        return torch.cat([dense_rows] + pieces, dim=1).reshape(bsz * length, -1)
++            pieces.append(
++                chunk_fn(q4[:, r0:r1], qi4[:, r0:r1], wi3[:, r0:r1], positions[r0:r1], pk, lat, self.W_UK_T, self.W_UV,
++                         float(self.scale), float(ind.softmax_scale), ind.topk_tokens, ind.kpool))
++            if q.device.type == "hpu" and (n + 1) % self._DSA_SYNC_EVERY == 0:
++                torch.hpu.synchronize()
++        return torch.cat(pieces, dim=1).reshape(bsz * length, -1)
+ 
+     def _dsa_sparse_decode(self, decode_ql_nope, kv_cache, attn_metadata, sparse):
+         """Top-k KV gather for decode: latent attention over the 2051 selected physical KV slots of each sequence."""
+diff --git a/vllm_gaudi/ops/hpu_dsa_indexer.py b/vllm_gaudi/ops/hpu_dsa_indexer.py
+index 2c2d5b7..c6c79e1 100644
+--- a/vllm_gaudi/ops/hpu_dsa_indexer.py
++++ b/vllm_gaudi/ops/hpu_dsa_indexer.py
+@@ -184,24 +184,21 @@ def decode_sparse_block_bias(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.
+ # ---------------------------------------------------------------------------------------------------------------
+ 
+ 
+-def prefill_select_tokens(q: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, scale: float, topk: int, kpool: int,
+-                          row0: int, row1: int) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Token positions attended by query rows [row0, row1) of bucketed prompts (token t at position t).
++def prefill_select_tokens_rows(q_rows: torch.Tensor, pk: torch.Tensor, w_rows: torch.Tensor, qpos: torch.Tensor,
++                               scale: float, topk: int, kpool: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Token positions attended by a block of query rows (static-shape friendly: no Python row offsets).
+ 
+-    q [B, L, H, D] indexer queries, pk [B, L/kpool, D] pooled keys, w [B, L, H] head weights.
+-    Requires row0 >= topk + kpool - 1, where every row has at least topk/kpool complete visible pools.
+-    Returns idx [B, C, topk + kpool - 1] (topk pool tokens, then kpool-1 tail slots) and valid [B, C, same].
++    q_rows [B, C, H, D], w_rows [B, C, H] for query positions qpos [C] (each >= topk + kpool - 1),
++    pk [B, P, D] pooled keys. Returns idx [B, C, topk + kpool - 1] and valid [B, C, same].
+     """
+-    assert row0 >= topk + kpool - 1, (row0, topk, kpool)
+-    b = q.shape[0]
++    b = q_rows.shape[0]
+     p_all = pk.shape[1]
+-    dev = q.device
+-    qpos = torch.arange(row0, row1, device=dev)
+-    s = index_scores(q[:, row0:row1], pk, w[:, row0:row1], scale)  # [B, C, P]
++    dev = q_rows.device
++    s = index_scores(q_rows, pk, w_rows, scale)  # [B, C, P]
+     pool_end = torch.arange(p_all, device=dev) * kpool + (kpool - 1)
+     visible = pool_end.unsqueeze(0) <= qpos.unsqueeze(1)  # [C, P]
+     s = s.masked_fill(~visible.unsqueeze(0), torch.finfo(torch.float32).min)
+-    sel = s.topk(topk // kpool, dim=-1).indices  # [B, C, topk/kpool], all visible for row0 >= topk + kpool - 1
++    sel = s.topk(topk // kpool, dim=-1).indices  # [B, C, topk/kpool]
+     tok = (sel.unsqueeze(-1) * kpool + torch.arange(kpool, device=dev)).flatten(-2)  # [B, C, topk]
+     tail_start = (qpos + 1) // kpool * kpool
+     tail = tail_start.unsqueeze(1) + torch.arange(kpool - 1, device=dev)  # [C, kpool-1]
+@@ -212,6 +209,19 @@ def prefill_select_tokens(q: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, sc
+     return idx, valid
+ 
+ 
++def prefill_select_tokens(q: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, scale: float, topk: int, kpool: int,
++                          row0: int, row1: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Token positions attended by query rows [row0, row1) of bucketed prompts (token t at position t).
++
++    q [B, L, H, D] indexer queries, pk [B, L/kpool, D] pooled keys, w [B, L, H] head weights.
++    Requires row0 >= topk + kpool - 1, where every row has at least topk/kpool complete visible pools.
++    Returns idx [B, C, topk + kpool - 1] (topk pool tokens, then kpool-1 tail slots) and valid [B, C, same].
++    """
++    assert row0 >= topk + kpool - 1, (row0, topk, kpool)
++    qpos = torch.arange(row0, row1, device=q.device)
++    return prefill_select_tokens_rows(q[:, row0:row1], pk, w[:, row0:row1], qpos, scale, topk, kpool)
++
++
+ def latent_gather_attention(q_lat: torch.Tensor, lat: torch.Tensor, idx: torch.Tensor, valid: torch.Tensor,
+                             scale: float) -> torch.Tensor:
+     """q_lat [B, C, H, R] (query already multiplied by W_UK^T), lat [B, L, R] prompt latents, idx/valid [B, C, K]
+@@ -297,6 +307,35 @@ def latent_decode_attention(q_lat: torch.Tensor, kv_rows: torch.Tensor, slots: t
+     a = torch.softmax(sc, dim=-1).to(kv_rows.dtype)
+     return torch.einsum("bhk,bkr->bhr", a, sel)
+ 
++
++def dsa_prefill_chunk(q_rows: torch.Tensor, qi_rows: torch.Tensor, wi_rows: torch.Tensor, qpos: torch.Tensor,
++                      pk: torch.Tensor, lat: torch.Tensor, w_uk_t: torch.Tensor, w_uv: torch.Tensor, attn_scale: float,
++                      idx_scale: float, topk: int, kpool: int) -> torch.Tensor:
++    """One block of sparse prefill rows: selection + latent gather attention + W_UV projection.
++
++    q_rows [B, C, H, Dqk] MLA queries, qi_rows [B, C, Hi, Di] / wi_rows [B, C, Hi] indexer queries and weights,
++    qpos [C] positions, pk [B, P, Di] pooled keys, lat [B, L, R] prompt latents, w_uk_t [H, Dqk, R], w_uv [H, R, V].
++    Returns [B, C, H * V].
++    """
++    b, c, h, _ = q_rows.shape
++    idx, valid = prefill_select_tokens_rows(qi_rows, pk, wi_rows, qpos, idx_scale, topk, kpool)
++    q_lat = torch.einsum("bchp,hpr->bchr", q_rows, w_uk_t)
++    o = latent_gather_attention(q_lat, lat, idx, valid, attn_scale)  # [B, C, H, R]
++    v = torch.einsum("bchr,hrv->bchv", o, w_uv)
++    return v.reshape(b, c, -1)
++
++
++_COMPILED_KERNELS: dict = {}
++
++
++def compiled_on(fn, device_type: str):
++    """Static-shape HPU compile of a kernel (one torch.compile object per function); eager elsewhere (CPU tests)."""
++    if device_type != "hpu":
++        return fn
++    if fn.__name__ not in _COMPILED_KERNELS:
++        _COMPILED_KERNELS[fn.__name__] = torch.compile(fn, backend="hpu_backend", dynamic=False)
++    return _COMPILED_KERNELS[fn.__name__]
++
+ def dense_exact_len(topk: int, kpool: int) -> int:
+     """Longest sequence for which the sparse selection covers every visible token."""
+     return topk + kpool - 1
+@@ -304,6 +343,6 @@ def dense_exact_len(topk: int, kpool: int) -> int:
+ 
+ __all__ = [
+     "HPUKpoolIndexer", "pool_keys", "index_scores", "prefill_sparse_bias", "decode_sparse_block_bias",
+-    "prefill_select_tokens", "latent_gather_attention", "decode_select_slots", "latent_decode_attention",
++    "prefill_select_tokens", "prefill_select_tokens_rows", "latent_gather_attention", "dsa_prefill_chunk", "compiled_on", "decode_select_slots", "latent_decode_attention",
+     "dense_exact_len"
+ ]
+-- 
+2.43.0
+

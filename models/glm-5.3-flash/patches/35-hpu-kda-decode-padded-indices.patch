@@ -1,0 +1,58 @@
+From 97ce68322383a478adcd34952abf6caf6ec28d53 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 01:22:25 +0000
+Subject: [PATCH] HPU KDA decode: pad state indices to the bucketed batch so
+ the single-step fast path is always taken
+
+---
+ vllm_gaudi/models/glm5next_kda.py | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index a76a7d9..617a130 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -208,15 +208,28 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+                 qsl = torch.arange(
+                     qkv.size(0) + 1, device=qkv.device, dtype=torch.int32
+                 )
++            # Decode batches are padded to the bs bucket; the recurrent kernel's
++            # single-step fast path needs one state index per (padded) token or it
++            # falls into the dynamo-disabled per-token Python loop (~3 s/step at
++            # bs 16). Pad indices with -1 (-> the plugin's padding slot via
++            # remainder) or truncate so len(indices) == num_tokens.
++            dec_idx = state_indices
++            if dec_idx is not None:
++                dec_idx = dec_idx.reshape(-1)
++                n_tok = qkv.size(0)
++                if dec_idx.numel() < n_tok:
++                    dec_idx = torch.cat(
++                        [dec_idx, dec_idx.new_full((n_tok - dec_idx.numel(),), -1)]
++                    )
++                elif dec_idx.numel() > n_tok:
++                    dec_idx = dec_idx[:n_tok]
+             mixed = hpu_causal_conv1d_update(
+                 x=qkv,
+                 conv_state=conv_state,
+                 weight=conv_weights,
+                 bias=conv_bias,
+                 activation="silu",
+-                conv_state_indices=(
+-                    state_indices[:num_decodes] if state_indices is not None else state_indices
+-                ),
++                conv_state_indices=dec_idx,
+                 query_start_loc=qsl,
+             )
+             q, k, v = mixed.split(self.local_projection_size, dim=-1)
+@@ -227,7 +240,7 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+                 q, k, v, g.unsqueeze(0), beta.unsqueeze(0),
+                 initial_state=ssm_state,
+                 inplace_final_state=True,
+-                ssm_state_indices=state_indices,
++                ssm_state_indices=dec_idx,
+                 use_qk_l2norm_in_kernel=True,
+             )
+             core = core.reshape(-1, self.local_num_heads, self.head_dim)
+-- 
+2.43.0
+

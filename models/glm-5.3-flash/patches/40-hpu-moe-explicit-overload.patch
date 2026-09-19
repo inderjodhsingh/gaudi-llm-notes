@@ -1,0 +1,71 @@
+From 2db791c5a1855d87ff32b53d032d39f47b06420b Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 05:56:44 +0000
+Subject: [PATCH] HPU FP8 MoE: call
+ mixture_of_experts.fp8_fused_weights_dynamic directly; drop the dynamo graph
+ break
+
+In-worker measurements (GLM-5.3, T=512): packet call 0.24 s, explicit
+overload 0.055 s eager, 0.003 s inside a compiled graph. The packet's
+overload search (21 overloads; failing candidates repr() every expert
+weight) was the cost behind both the compile-time storm and the slow
+eager prefill after patch 37. Keep the op inside the compiled graph.
+---
+ vllm_gaudi/extension/ops.py | 20 ++++----------------
+ 1 file changed, 4 insertions(+), 16 deletions(-)
+
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index d098cde..705ba0a 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -789,11 +789,6 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
+         self._cache_weight_lists()
+         return ret
+ 
+-    # Explicit graph break: dynamo's fake-tensor trace of torch.ops.hpu.mixture_of_experts
+-    # fails schema matching and formats every expert weight tensor into the error text
+-    # (minutes per new bucket on GLM-5.3, 72 fp8 tensors). The op ran eagerly after that
+-    # break anyway; skipping the trace attempt removes the compile-time cost only.
+-    @torch._dynamo.disable
+     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
+         expert_routing_table, emin, emax = _localize_routing_ids(expert_routing_table, self.experts_min, self.experts_max,
+                                                           getattr(self, 'global_num_experts', None))
+@@ -1328,11 +1323,6 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
+         self.w2_list = torch.nn.ModuleList(
+             [MoeFP8Matmul(quant_method=FusedMoeWeightScaleSupported.BLOCK.value) for _ in range(num_experts)])
+ 
+-    # Explicit graph break: dynamo's fake-tensor trace of torch.ops.hpu.mixture_of_experts
+-    # fails schema matching and formats every expert weight tensor into the error text
+-    # (minutes per new bucket on GLM-5.3, 72 fp8 tensors). The op ran eagerly after that
+-    # break anyway; skipping the trace attempt removes the compile-time cost only.
+-    @torch._dynamo.disable
+     def forward(
+         self,
+         x,
+@@ -1431,11 +1421,6 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+         self._cache_weight_lists()
+         return ret
+ 
+-    # Explicit graph break: dynamo's fake-tensor trace of torch.ops.hpu.mixture_of_experts
+-    # fails schema matching and formats every expert weight tensor into the error text
+-    # (minutes per new bucket on GLM-5.3, 72 fp8 tensors). The op ran eagerly after that
+-    # break anyway; skipping the trace attempt removes the compile-time cost only.
+-    @torch._dynamo.disable
+     def forward(
+         self,
+         x,
+@@ -1465,7 +1450,10 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
+ 
+         if self.w13_input_scale is None:
+             x_fp8, x_scale = dynamic_quant(x)
+-            final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
++            # Call the overload directly: the packet's overload search costs ~0.2 s
++            # per call in eager mode (21 overloads, error strings repr() every
++            # expert weight) and derails dynamo's fake-tensor trace of this op.
++            final_hidden_states = torch.ops.hpu.mixture_of_experts.fp8_fused_weights_dynamic(hidden_states=x_fp8,
+                                                                    expert_routing_table=topk_ids.to(torch.int64),
+                                                                    router_weights=topk_weights.to(x.dtype),
+                                                                    w12=w13_list,
+-- 
+2.43.0
+

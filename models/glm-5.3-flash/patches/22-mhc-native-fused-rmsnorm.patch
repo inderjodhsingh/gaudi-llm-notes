@@ -1,0 +1,69 @@
+From e2e4cf45502408250727843b3b6a0115c943dcb5 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 15:02:50 +0000
+Subject: [PATCH] mHC native pre: fuse RMSNorm when norm_weight is set
+
+HPU CustomOp uses forward_native; CUDA/tilelang already RMSNorm
+layer_input. Skipping it left KDA/MLA unnormalized (garbage logits).
+---
+ vllm/model_executor/kernels/mhc/torch.py | 12 +++++++++++-
+ vllm/model_executor/layers/mhc.py        |  6 ++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/kernels/mhc/torch.py b/vllm/model_executor/kernels/mhc/torch.py
+index 1a54ce4ad..d6290916d 100644
+--- a/vllm/model_executor/kernels/mhc/torch.py
++++ b/vllm/model_executor/kernels/mhc/torch.py
+@@ -14,6 +14,8 @@ def mhc_pre_torch(
+     hc_post_mult_value: float,
+     sinkhorn_repeat: int,
+     n_splits: int = 1,
++    norm_weight: torch.Tensor | None = None,
++    norm_eps: float = 0.0,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Forward pass for mHC pre block.
+@@ -83,7 +85,15 @@ def mhc_pre_torch(
+ 
+     layer_input = torch.sum(
+         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
+-    ).to(torch.bfloat16)
++    )
++    # Match tilelang/CUDA: fuse RMSNorm into pre when norm_weight is set.
++    # HPU CustomOp uses this native path; skipping the norm left KDA/MLA
++    # unnormalized and produced garbage logits.
++    if norm_weight is not None:
++        var = layer_input.pow(2).mean(dim=-1, keepdim=True)
++        layer_input = layer_input * torch.rsqrt(var + norm_eps)
++        layer_input = layer_input * norm_weight.to(layer_input.dtype)
++    layer_input = layer_input.to(torch.bfloat16)
+     return (
+         post_mix.view(*outer_shape, hc_mult, 1),
+         comb_mix.view(*outer_shape, hc_mult, hc_mult),
+diff --git a/vllm/model_executor/layers/mhc.py b/vllm/model_executor/layers/mhc.py
+index d1a9783a1..006f3868a 100644
+--- a/vllm/model_executor/layers/mhc.py
++++ b/vllm/model_executor/layers/mhc.py
+@@ -162,6 +162,9 @@ class MHCPreOp(CustomOp):
+             hc_sinkhorn_eps,
+             hc_post_mult_value,
+             sinkhorn_repeat,
++            n_splits,
++            norm_weight,
++            norm_eps,
+         )
+ 
+     def forward_xpu(
+@@ -541,6 +544,9 @@ class MHCFusedPostPreOp(CustomOp):
+             hc_sinkhorn_eps,
+             hc_post_mult_value,
+             sinkhorn_repeat,
++            n_splits,
++            norm_weight,
++            norm_eps,
+         )
+         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+ 
+-- 
+2.43.0
+

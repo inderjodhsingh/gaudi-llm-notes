@@ -1,0 +1,278 @@
+From b973a24ed227c5f1b46bc77de8a167e2aa9c60a4 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:11:34 +0000
+Subject: [PATCH] reconstruct _e4m3fn_bits_to_cpu; CPU dequant; GLM53_LOAD_ONLY
+ dump after load_weights
+
+---
+ vllm_gaudi/extension/ops.py              |  35 ++++++-
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 112 ++++++++++++++++++++++-
+ 2 files changed, 141 insertions(+), 6 deletions(-)
+
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index 7310a61..85b78bf 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -34,6 +34,25 @@ import os
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _e4m3fn_bits_to_cpu(t: torch.Tensor) -> torch.Tensor:
++    """Bit-copy float8_e4m3fn to CPU without Gaudi2 exp=15 Inf/NaN rewrite.
++
++    Gaudi2's e4m3fn decoder turns exp=15 lanes into Inf/NaN. Copy via uint8
++    so the IEEE bits are preserved, then view as float8_e4m3fn on CPU.
++    Must run before ``.to("hpu")`` of e4m3fn; a later bit-copy from HPU is
++    already dead. Non-e4m3fn tensors are just moved to CPU.
++    """
++    if not torch.is_tensor(t):
++        return t
++    if t.dtype != torch.float8_e4m3fn:
++        return t.detach().to("cpu") if t.device.type != "cpu" else t.detach()
++    u8 = t.detach().contiguous().view(torch.uint8)
++    if u8.device.type != "cpu":
++        u8 = u8.cpu()
++    return u8.view(torch.float8_e4m3fn)
++
++
+ # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
+ try:
+     MAX_EXPERTS_PER_SLICE = int(os.environ.get("MAX_EXPERTS_PER_SLICE", -1))
+@@ -898,8 +917,15 @@ def dequant_block_fp8_weight_naive(weight,
+                                    original_M=None,
+                                    original_N=None,
+                                    do_unpad=False):
++    orig_device = weight.device
++    if weight.dtype == torch.float8_e4m3fn:
++        # CPU dequant: Gaudi2 e4m3fn exp=15 -> Inf/NaN if this runs on HPU.
++        weight = _e4m3fn_bits_to_cpu(weight)
++        if weight_scale is not None:
++            weight_scale = weight_scale.detach().to("cpu")
+     if weight_scale is None:
+-        return weight
++        out = weight.to(dtype)
++        return out.to(orig_device) if out.device != orig_device else out
+     if weight_scale.device != weight.device:
+         weight_scale = weight_scale.to(weight.device)
+     assert len(block_size) == 2
+@@ -929,6 +955,8 @@ def dequant_block_fp8_weight_naive(weight,
+     if do_unpad:
+         dequant_weight = unpad_weight(dequant_weight, original_M, original_N, keep_first_dim=keep_first_dim)
+ 
++    if dequant_weight.device != orig_device:
++        dequant_weight = dequant_weight.to(orig_device)
+     return dequant_weight
+ 
+ 
+@@ -1047,7 +1075,10 @@ def gaudi_weight_wrapper(weight_loader):
+             else:
+                 loaded_weight = args[1]
+             if loaded_weight.dtype == torch.float8_e4m3fn:
+-                loaded_weight = (loaded_weight.float() * 0.5).to(torch.float8_e4m3fn)
++                # Bit-copy to CPU first. ``.float()`` on HPU e4m3fn rewrites
++                # exp=15 to Inf; the *0.5 is the fn→fnuz scale adjustment.
++                w_cpu = _e4m3fn_bits_to_cpu(loaded_weight)
++                loaded_weight = (w_cpu.float() * 0.5).to(torch.float8_e4m3fn)
+             else:
+                 loaded_weight = (loaded_weight.data * 2.0)
+             if in_kwargs:
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 1d7b908..f91dd3b 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -133,6 +133,86 @@ from vllm.model_executor.models.bert import _encode_token_type_ids
+ logger = init_logger()
+ 
+ 
++def _glm53_dump_loaded_tensors(runner) -> None:
++    """Phase 1 gate artifact: per-rank tensor manifest + HBM, then the caller exits."""
++    import json
++    from collections import Counter
++
++    rank = 0
++    try:
++        rank = get_tensor_model_parallel_rank()
++    except Exception:
++        rank = int(os.environ.get("RANK", "0"))
++    out_dir = os.environ.get("GLM53_LOAD_DUMP_DIR", "/work/logs")
++    os.makedirs(out_dir, exist_ok=True)
++
++    tensors = []
++    dtype_counts: Counter[str] = Counter()
++    nbytes = 0
++    for name, p in runner.model.named_parameters():
++        t = p.detach()
++        dt = str(t.dtype).replace("torch.", "")
++        n = int(t.numel()) * (t.element_size() if t.dtype != torch.float8_e4m3fn else 1)
++        tensors.append({
++            "name": name,
++            "dtype": dt,
++            "shape": list(t.shape),
++            "device": str(t.device),
++            "numel": int(t.numel()),
++        })
++        dtype_counts[dt] += 1
++        nbytes += n
++
++    hbm_alloc = None
++    hbm_max = None
++    try:
++        hbm_alloc = int(torch.hpu.memory_allocated())
++        hbm_max = int(torch.hpu.max_memory_allocated())
++    except Exception:
++        pass
++    profiler_gb = None
++    try:
++        profiler_gb = float(runner.model_memory_usage) / float(2**30)
++    except Exception:
++        pass
++
++    loaded = None
++    for obj in (runner.model, getattr(runner.model, "language_model", None)):
++        if obj is None:
++            continue
++        loaded = getattr(obj, "_glm53_loaded_params", None)
++        if loaded:
++            break
++
++    payload = {
++        "rank": rank,
++        "n_params": len(tensors),
++        "n_loaded_keys": len(loaded) if loaded is not None else None,
++        "dtype_counts": dict(dtype_counts),
++        "param_nbytes": nbytes,
++        "param_gib": nbytes / float(2**30),
++        "hbm_alloc_bytes": hbm_alloc,
++        "hbm_alloc_gib": None if hbm_alloc is None else hbm_alloc / float(2**30),
++        "hbm_max_bytes": hbm_max,
++        "hbm_max_gib": None if hbm_max is None else hbm_max / float(2**30),
++        "profiler_consumed_gib": profiler_gb,
++        "model": getattr(runner.model_config, "model", None),
++        "tensors": tensors,
++        "loaded_keys": sorted(loaded) if loaded is not None else None,
++    }
++    path = os.path.join(out_dir, f"loaded_tensors.rank{rank}.json")
++    with open(path, "w") as f:
++        json.dump(payload, f)
++    logger.info(
++        "GLM53_LOAD_ONLY dump %s params=%d dtypes=%s hbm_alloc_GiB=%.2f profiler_GiB=%s",
++        path,
++        len(tensors),
++        dict(dtype_counts),
++        (hbm_alloc or 0) / float(2**30),
++        None if profiler_gb is None else f"{profiler_gb:.2f}",
++    )
++
++
+ def is_interleaved(config: Any) -> bool:
+     """Detect if the model with this config uses interleaved attention.
+ 
+@@ -161,7 +241,8 @@ except ImportError:
+ _GDN_MAMBA_TYPES: tuple[object, ...] = ("gdn_attention", "linear_attention")
+ try:
+     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+-    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, "gdn_attention",
++    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR,
++                        MambaAttentionBackendEnum.SHORT_CONV, "gdn_attention",
+                         "linear_attention")
+ except (ImportError, AttributeError):
+     pass
+@@ -791,11 +872,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+ 
+     mamba_like_arch = [
+         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
+-        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
++        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"
+     ]
+     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
+         return
+-    mamba_like_layer = ['.mixer', '.linear_attn']
++    mamba_like_layer = ['.mixer', '.linear_attn', '.ple']
+ 
+     def _get_decoder_layer_by_idx(model_obj, idx: int):
+         # Qwen3.5 multimodal path: model.language_model.model.layers
+@@ -839,6 +920,12 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+                 layer = _get_decoder_layer_by_idx(model, layer_idx)
+                 if layer is not None and hasattr(layer, "linear_attn"):
+                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
++            elif layer_name.endswith('.ple'):
++                # Qwen4Exp PLE (n-gram) layer: short-conv + token state in its own cache group.
++                layer_idx = int(layer_name.split('.')[-2])
++                layer = _get_decoder_layer_by_idx(model, layer_idx)
++                if layer is not None and getattr(layer, "ple", None) is not None:
++                    layer.ple.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
+ 
+ 
+ def maybe_set_chunked_attention_layers(model_runner):
+@@ -880,7 +967,7 @@ def apply_model_specific_patches(model_runner):
+ 
+     is_llama4 = is_hpu_llama4_model(model_runner.model)
+     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
+-    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
++    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen4_exp", "qwen4_exp_text")
+     is_gemma4 = model_type in ("gemma4", )
+ 
+     model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
+@@ -1498,6 +1585,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+             block_sizes=[self.block_size],
+             kernel_block_sizes=[self.block_size],
+             is_spec_decode=bool(self.vllm_config.speculative_config),
++            num_spec_tokens=(0 if self.vllm_config.speculative_config is None else
++                             int(self.vllm_config.speculative_config.num_speculative_tokens)),
+             logitsprocs=build_logitsprocs(self.vllm_config, self.device, self.pin_memory, self.is_pooling_model,
+                                           self.vllm_config.model_config.logits_processors),
+         )
+@@ -4841,6 +4930,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         self.model_memory_usage = m.consumed_device_memory
+         logger.info("Loading model weights took %.4f GB", self.model_memory_usage / float(2**30))
+ 
++        if os.environ.get("GLM53_LOAD_ONLY", "0") == "1":
++            _glm53_dump_loaded_tensors(self)
++            logger.info("GLM53_LOAD_ONLY: exiting after load_weights")
++            os._exit(0)
++
+         if self._is_quant_with_inc():
+             logger.info("Preparing model with INC..")
+             with HabanaMemoryProfiler() as m_inc:
+@@ -5018,6 +5112,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         1. Children of the nn.ModuleList
+         2. Member of regional_compilation_layers_list
+         """
++        if getattr(module, "_no_regional_compile", False):
++            logger.info("skip regional compile of %s (%s); outer group regions will fuse",
++                        type(module).__name__, module_name)
++            return
+         if isinstance(module, torch.nn.ModuleList):
+             for children_name, children_module in module.named_children():
+                 self._compile_region(module, children_name, children_module)
+@@ -5032,6 +5130,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 self._regional_compilation(children_module, module, children_name)
+ 
+     def _compile_region(self, model, name, module):
++        logger.info("compile region %s (%s)", name, type(module).__name__)
+         module = self._compile(module)
+         setattr_nested(model, name, module)
+ 
+@@ -6247,6 +6346,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 vocab_size=self.model_config.get_vocab_size(),
+                 block_sizes=[self.block_size],
+                 kernel_block_sizes=[self.block_size],
++                is_spec_decode=bool(self.vllm_config.speculative_config),
++                num_spec_tokens=(0 if self.vllm_config.speculative_config is None else
++                                 int(self.vllm_config.speculative_config.num_speculative_tokens)),
+                 logitsprocs=build_logitsprocs(self.vllm_config, self.device, self.pin_memory, self.is_pooling_model,
+                                               self.vllm_config.model_config.logits_processors),
+             )
+@@ -7025,6 +7127,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 block_sizes=block_sizes,
+                 kernel_block_sizes=kernel_block_sizes,
+                 is_spec_decode=bool(self.vllm_config.speculative_config),
++                num_spec_tokens=(0 if self.vllm_config.speculative_config is None else
++                                 int(self.vllm_config.speculative_config.num_speculative_tokens)),
+                 logitsprocs=self.input_batch.logitsprocs,
+                 is_pooling_model=self.is_pooling_model,
+             )
+-- 
+2.43.0
+

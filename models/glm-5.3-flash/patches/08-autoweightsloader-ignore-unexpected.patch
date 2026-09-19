@@ -1,0 +1,49 @@
+From b408a54b5dea1ba712189ab9a929846b52a2b94a Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 05:17:10 +0000
+Subject: [PATCH] use ignore_unexpected_prefixes (v0.29 AutoWeightsLoader has
+ no skip_prefixes)
+
+---
+ vllm/models/glm5next/nvidia/model.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index b326628a4..db2e2cef0 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -967,7 +967,9 @@ class Glm5NextForCausalLM(
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
++            ignore_unexpected_prefixes=(
++                ["lm_head."] if self.config.tie_word_embeddings else None
++            ),
+         )
+         loaded = loader.load_weights(weights)
+         self._glm53_loaded_params = loaded
+@@ -1074,15 +1076,17 @@ class Glm5NextForConditionalGeneration(
+         return config
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        skip_prefixes = []
++        ignore = []
+         mapper_kwargs: dict = {}
+         if getattr(self, "language_model_only", False):
+-            skip_prefixes.append("visual.")
++            ignore.append("visual.")
+             mapper_kwargs["orig_to_new_prefix"] = {"visual.": None}
+         mapper = self.hf_to_vllm_mapper
+         if mapper_kwargs:
+             mapper = mapper | WeightsMapper(**mapper_kwargs)
+-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes or None)
++        loader = AutoWeightsLoader(
++            self, ignore_unexpected_prefixes=ignore or None
++        )
+         loaded = loader.load_weights(weights, mapper=mapper)
+         self._glm53_loaded_params = loaded
+         return loaded
+-- 
+2.43.0
+

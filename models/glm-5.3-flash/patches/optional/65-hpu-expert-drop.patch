@@ -1,0 +1,1253 @@
+From 4621ad58c25b45dab2e0a1e939375e3139593ac7 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 14:03:33 +0000
+Subject: [PATCH] patch 65: GLM53_EXPERT_DROP - physically drop experts on the
+ HPU MoE path
+
+Per-layer plan from the mask file: kept set, dense ids, rank r keeps the kept experts of its original slice
+(contiguous dense range [start_r, start_r+n_r)). Registers the patch-64 expert-map override (dropped -> -1 so the
+weights are never allocated), builds the fused op with (|K_L|, n_r, start_r, start_r+n_r-1), remaps routing ids
+global -> dense after selection, keeps the patch-62 mask installed from the same file, keeps the patch-61 histogram
+in global ids, fails loud on every mismatch. Zero effect when unset. CPU tests 9/9.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tests/unit_tests/ops/test_expert_drop_cpu.py | 533 +++++++++++++++++++
+ vllm_gaudi/extension/ops.py                  |  12 +-
+ vllm_gaudi/ops/hpu_compressed_tensors.py     |  17 +-
+ vllm_gaudi/ops/hpu_expert_mask.py            | 317 +++++++++++
+ vllm_gaudi/ops/hpu_fp8.py                    |  16 +-
+ vllm_gaudi/ops/hpu_fused_moe.py              |  39 +-
+ vllm_gaudi/ops/hpu_moe_combine.py            |   7 +-
+ vllm_gaudi/ops/hpu_moe_gather_fast.py        |   4 +-
+ vllm_gaudi/ops/hpu_mxfp4.py                  |   3 +
+ vllm_gaudi/v1/worker/hpu_model_runner.py     |   9 +-
+ 10 files changed, 925 insertions(+), 32 deletions(-)
+ create mode 100644 tests/unit_tests/ops/test_expert_drop_cpu.py
+
+diff --git a/tests/unit_tests/ops/test_expert_drop_cpu.py b/tests/unit_tests/ops/test_expert_drop_cpu.py
+new file mode 100644
+index 0000000..8adf7bc
+--- /dev/null
++++ b/tests/unit_tests/ops/test_expert_drop_cpu.py
+@@ -0,0 +1,533 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU unit test for the GLM53_EXPERT_DROP physical expert drop (patches 64/65).
++
++Needs torch + the Python stdlib + the modules under test:
++  * vllm_gaudi/ops/hpu_expert_mask.py, loaded by file path (no HPU platform plugin needed);
++  * _localize_routing_ids / _route_hist_count from vllm_gaudi/extension/ops.py, extracted from the source with
++    ``ast`` and exec'd against plain torch (importing the module needs habana_frameworks);
++  * vLLM's ExpertMapManager (patch 64 hook) and cpu_moe.grouped_topk (the routing the HPU monolithic path runs).
++
++Run:  python3 tests/unit_tests/ops/test_expert_drop_cpu.py      (or via pytest)
++"""
++from __future__ import annotations
++
++import ast
++import contextlib
++import importlib.util
++import io
++import json
++import os
++import pathlib
++import tempfile
++
++import torch
++
++_HERE = pathlib.Path(__file__).resolve()
++_ROOT = _HERE.parents[3]
++_MASK_MOD_PATH = _ROOT / "vllm_gaudi" / "ops" / "hpu_expert_mask.py"
++_OPS_PATH = _ROOT / "vllm_gaudi" / "extension" / "ops.py"
++
++E, K, RSF, EP = 288, 8, 2.5, 8  # GLM-5.3-Flash: 288 routed experts, top-8, scale 2.5, EP=8 (36 per rank)
++
++
++def _load_mask_module():
++    spec = importlib.util.spec_from_file_location("hpu_expert_mask_under_test", _MASK_MOD_PATH)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _load_ops_functions():
++    """Exec only ROUTE_HIST / _route_hist_count / _localize_routing_ids from extension/ops.py (real source)."""
++    tree = ast.parse(_OPS_PATH.read_text())
++    wanted = {"_route_hist_count", "_localize_routing_ids"}
++    nodes = []
++    for node in tree.body:
++        if isinstance(node, ast.FunctionDef) and node.name in wanted:
++            nodes.append(node)
++        elif isinstance(node, ast.Assign) and any(
++                isinstance(t, ast.Name) and t.id == "ROUTE_HIST" for t in node.targets):
++            nodes.append(node)
++    assert len(nodes) == 3, [getattr(n, "name", "ROUTE_HIST") for n in nodes]
++    ns = {"torch": torch}
++    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(_OPS_PATH), "exec"), ns)
++    return ns
++
++
++em = _load_mask_module()
++ops = _load_ops_functions()
++from vllm.model_executor.layers.fused_moe.experts.cpu_moe import grouped_topk  # noqa: E402
++
++
++@contextlib.contextmanager
++def _env(**kv):
++    old = {k: os.environ.get(k) for k in kv}
++    try:
++        for k, v in kv.items():
++            if v is None:
++                os.environ.pop(k, None)
++            else:
++                os.environ[k] = v
++        em._cached_plan.cache_clear()
++        em.load_expert_mask_spec.cache_clear()
++        yield
++    finally:
++        for k, v in old.items():
++            if v is None:
++                os.environ.pop(k, None)
++            else:
++                os.environ[k] = v
++        em._cached_plan.cache_clear()
++        em.load_expert_mask_spec.cache_clear()
++
++
++# Layer 17: strongly non-uniform. rank 0 keeps 36, rank 1 keeps 1 (drops 35), rank 2 keeps 14, rank 5 keeps 5,
++# others keep 36; 88 dropped, 200 kept. Layer 20: rank 2 fully dropped -> ValueError. Layer 30: empty list.
++_L17_DROPPED = sorted(set(range(37, 72)) | set(range(72, 88)) | set(range(180, 211)) | {100, 101, 102, 103, 104, 105})
++_L20_DROPPED = list(range(72, 108))
++SPEC = {"17": _L17_DROPPED, "30": [], "44": [0, 287]}
++
++
++def _write_spec(d, spec=SPEC, name="drop.json"):
++    path = os.path.join(d, name)
++    with open(path, "w") as f:
++        json.dump(spec, f)
++    return path
++
++
++def test_plan_kept_dense_ids_and_per_rank_ranges():
++    plan = em.expert_plan(17, EP, E, _L17_DROPPED)
++    kept = [g for g in range(E) if g not in set(_L17_DROPPED)]
++    assert list(plan.kept) == kept and plan.num_kept == 200 and plan.dropped == tuple(_L17_DROPPED)
++    assert plan.rank_slice == tuple((36 * r, 36 * r + 36) for r in range(EP))
++    assert plan.rank_count == (36, 1, 14, 36, 36, 5, 36, 36)  # non-uniform per rank
++    assert sum(plan.rank_count) == plan.num_kept
++    starts = [0]
++    for n in plan.rank_count[:-1]:
++        starts.append(starts[-1] + n)
++    assert plan.rank_start == tuple(starts)
++    g2d = plan.global_to_dense()
++    assert len(g2d) == E and plan.sentinel == 200
++    assert all(g2d[g] == 200 for g in _L17_DROPPED)
++    assert [g2d[g] for g in kept] == list(range(200))  # dense id = rank among kept, ascending
++    for r in range(EP):
++        lo, hi = plan.rank_slice[r]
++        start, n = plan.local_range(r)
++        assert plan.experts_range(r) == (start, start + n - 1)
++        loc = plan.local_to_global(r)
++        assert len(loc) == n and all(lo <= g < hi for g in loc)  # keeps exactly its original slice's kept ids
++        assert [g2d[g] for g in loc] == list(range(start, start + n))  # contiguous dense range
++        m = plan.expert_map(r)
++        assert m.device.type == "cpu" and m.dtype == torch.int32
++        assert m.dtype == torch.int32 and m.shape == (E, )
++        assert (m != -1).sum() == n and m[list(loc)].tolist() == list(range(n))
++        assert all(m[g] == -1 for g in _L17_DROPPED)
++    inv = plan.dense_to_global()
++    assert len(inv) == 201 and inv[:200] == kept and inv[200] == E  # sentinel -> overflow bin
++    # uniform ranks stay at ep_rank*36 -> start only shifts by the earlier drops
++    assert plan.rank_start[0] == 0 and plan.rank_start[3] == 36 + 1 + 14
++
++
++def test_plan_rank_keeping_zero_raises_and_validation():
++    try:
++        em.expert_plan(20, EP, E, _L20_DROPPED)
++    except ValueError as e:
++        assert "rank 2" in str(e) and "keep 0" in str(e)
++    else:
++        raise AssertionError("a rank keeping 0 experts must be rejected")
++    for bad in ([E], [-1]):
++        try:
++            em.expert_plan(3, EP, E, bad)
++        except ValueError:
++            pass
++        else:
++            raise AssertionError(f"out-of-range id {bad} accepted")
++    # remainder placement matches vLLM's linear rule (10 experts on 4 ranks -> 3,3,2,2)
++    assert em._linear_slices(10, 4) == [(0, 3), (3, 6), (6, 8), (8, 10)]
++    p = em.expert_plan(0, 4, 10, [0, 9])
++    assert p.rank_count == (2, 3, 2, 1) and p.rank_start == (0, 2, 5, 7)
++    # no drop at all is a valid identity plan
++    p = em.expert_plan(3, EP, E, [])
++    assert p.rank_count == (36, ) * EP and p.global_to_dense() == list(range(E))
++
++
++def test_drop_env_reconciles_mask_env():
++    with tempfile.TemporaryDirectory() as d:
++        path = _write_spec(d)
++        other = _write_spec(d, {"17": [1]}, "other.json")
++        with _env(GLM53_EXPERT_DROP=None, GLM53_EXPERT_MASK=None):
++            assert em.reconcile_drop_env() is None and em.EXPERT_MASK_ENV not in os.environ
++            assert em.expert_drop_plan_for("model.layers.17.mlp.experts", EP, E) is None
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=None):
++            assert em.reconcile_drop_env() == path
++            assert os.environ[em.EXPERT_MASK_ENV] == path  # drop installs the mask from its own file
++            plan = em.expert_drop_plan_for("model.layers.17.mlp.experts", EP, E)
++            assert plan is not None and plan.layer_idx == 17
++            assert em.expert_drop_plan_for("model.layers.30.mlp.experts", EP, E) is None  # empty list
++            assert em.expert_drop_plan_for("model.layers.45.mlp.experts", EP, E) is None  # MTP unlisted -> dense
++            assert em.expert_drop_plan_for("lm_head", EP, E) is None
++            assert em.expert_drop_plan_for("model.layers.17.mlp.experts", EP, E) is plan  # cached
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=other):
++            try:
++                em.reconcile_drop_env()
++            except RuntimeError:
++                pass
++            else:
++                raise AssertionError("mask file != drop file must fail loud")
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=os.path.join(d, ".", "drop.json")):
++            assert em.reconcile_drop_env() == path  # same file spelled differently is fine
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=None):
++            try:
++                em.expert_drop_plan_for("model.layers.20.mlp.experts", EP, E)  # not in SPEC -> None
++                em._cached_plan.cache_clear()
++                em.load_expert_mask_spec.cache_clear()
++                with open(path, "w") as f:
++                    json.dump({"20": _L20_DROPPED}, f)
++                em.expert_drop_plan_for("model.layers.20.mlp.experts", EP, E)
++            except ValueError:
++                pass
++            else:
++                raise AssertionError("empty rank in the file must fail at plan time")
++
++
++def test_expert_map_override_and_log_line():
++    with tempfile.TemporaryDirectory() as d:
++        path = _write_spec(d)
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=None):
++            plan = em.expert_plan(17, EP, E, _L17_DROPPED)
++            for r in range(EP):
++                err = io.StringIO()
++                with contextlib.redirect_stderr(err):
++                    n_r, m = em.expert_map_override("model.layers.17.mlp.experts", EP, r, E)
++                start, n = plan.local_range(r)
++                assert n_r == n and torch.equal(m, plan.expert_map(r))
++                assert err.getvalue() == (f"[EXPERT-DROP] layer 17 rank {r}: keeps {n} of 36 local "
++                                          f"(dense [{start}, {start + n})), global kept 200 of 288\n")
++            err = io.StringIO()
++            with contextlib.redirect_stderr(err):
++                assert em.expert_map_override("model.layers.18.mlp.experts", EP, 0, E) is None
++                assert em.expert_map_override("model.layers.45.mlp.experts", EP, 0, E) is None
++            assert err.getvalue() == ""
++        with _env(GLM53_EXPERT_DROP=None, GLM53_EXPERT_MASK=None):
++            assert em.expert_map_override("model.layers.17.mlp.experts", EP, 0, E) is None
++
++
++def _vllm_manager(rank, layer_name, enable_eplb=False, use_ep=True):
++    from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
++    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
++    ep = EP if use_ep else 1
++    cfg = FusedMoEParallelConfig(tp_size=EP, pcp_size=1, dp_size=1, ep_size=ep, tp_rank=rank, pcp_rank=0,
++                                 dp_rank=0, ep_rank=rank if use_ep else 0, sp_size=1, use_ep=use_ep,
++                                 all2all_backend="naive", enable_eplb=enable_eplb)
++    return ExpertMapManager(max_num_batched_tokens=64, top_k=K, global_num_experts=E, num_redundant_experts=0,
++                            num_expert_group=1, moe_parallel_config=cfg, placement_strategy="linear",
++                            enable_eplb=enable_eplb, layer_name=layer_name)
++
++
++def test_vllm_expert_map_manager_override_and_env_unset_noop():
++    """Patch 64: the real ExpertMapManager takes the plugin's override; unset env is byte-identical."""
++    from vllm.model_executor.layers.fused_moe import expert_map_manager as emm
++    assert emm.get_expert_map_override() is em.expert_map_override  # registered at module import
++    ref = {r: _vllm_manager(r, "model.layers.17.mlp.experts") for r in range(EP)}  # env unset
++    with tempfile.TemporaryDirectory() as d:
++        path = _write_spec(d)
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=None):
++            plan = em.expert_plan(17, EP, E, _L17_DROPPED)
++            with contextlib.redirect_stderr(io.StringIO()):
++                for r in range(EP):
++                    mgr = _vllm_manager(r, "model.layers.17.mlp.experts")
++                    assert mgr.override_active and mgr.local_num_experts == plan.rank_count[r]
++                    assert torch.equal(mgr.expert_map, plan.expert_map(r)) and mgr.expert_mask is None
++                    assert mgr.get_local_expert_ids() == list(plan.local_to_global(r))
++                    for g in plan.local_to_global(r):
++                        assert mgr.is_local_expert(g)
++                    for g in _L17_DROPPED:
++                        assert not mgr.is_local_expert(g)
++                    try:
++                        mgr.update(mgr.moe_parallel_config, E)
++                    except RuntimeError:
++                        pass
++                    else:
++                        raise AssertionError("elastic EP update must be refused under an override")
++                    # unlisted layer on the same rank: stock placement
++                    plain = _vllm_manager(r, "model.layers.18.mlp.experts")
++                    assert not plain.override_active and plain.local_num_experts == 36
++                    assert torch.equal(plain.expert_map, ref[r].expert_map)
++                try:
++                    _vllm_manager(0, "model.layers.17.mlp.experts", enable_eplb=True)
++                except ValueError:
++                    pass
++                else:
++                    raise AssertionError("EPLB + override must be refused")
++                # TP without EP: the drop cannot take effect (no expert_map is consulted) -> clear ValueError
++                try:
++                    _vllm_manager(0, "model.layers.17.mlp.experts", use_ep=False)
++                except ValueError as e:
++                    assert "requires expert parallelism" in str(e), str(e)
++                else:
++                    raise AssertionError("override without EP must be refused")
++                # an unlisted layer without EP is untouched (hook returns None)
++                mgr = _vllm_manager(0, "model.layers.18.mlp.experts", use_ep=False)
++                assert not mgr.override_active and mgr.local_num_experts == E and mgr.expert_map is None
++    # env unset again: the hook returns None and everything is the standard placement
++    for r in range(EP):
++        mgr = _vllm_manager(r, "model.layers.17.mlp.experts")
++        assert not mgr.override_active and mgr.local_num_experts == 36
++        assert torch.equal(mgr.expert_map, ref[r].expert_map)
++        assert mgr.expert_map[36 * r:36 * r + 36].tolist() == list(range(36))
++
++
++class _FakeMoEConfig:
++
++    def __init__(self, rank):
++        self.ep_rank = rank
++        self.ep_size = EP
++        self.dp_size = 1
++
++
++class _FakeOp(torch.nn.Module):
++
++    def __init__(self, global_num_experts, num_experts, experts_min, experts_max):
++        super().__init__()
++        self.global_num_experts = global_num_experts
++        self.num_experts = num_experts
++        self.experts_min = experts_min
++        self.experts_max = experts_max
++
++
++class _FakeRoutedExperts(torch.nn.Module):
++    """Mimics vllm RoutedExperts after patch 64 sized the layer to n_r (or to 36 when uncut)."""
++
++    def __init__(self, layer_name, rank, local, expert_map=None, grouped=True):
++        super().__init__()
++        self.layer_name = layer_name
++        self.global_num_experts = E
++        self.local_num_experts = local
++        self.top_k = K
++        self.use_grouped_topk = grouped
++        self.num_expert_group = 1
++        self.topk_group = 1
++        self.moe_config = _FakeMoEConfig(rank)
++        self.e_score_correction_bias = torch.nn.Parameter(torch.zeros(E), requires_grad=False)
++        self.w13_weight = torch.nn.Parameter(torch.zeros(local, 4, 2, dtype=torch.float8_e4m3fn), requires_grad=False)
++        self.w2_weight = torch.nn.Parameter(torch.zeros(local, 2, 2, dtype=torch.float8_e4m3fn), requires_grad=False)
++        self.register_buffer("expert_map", expert_map, persistent=False)
++
++
++def test_install_expert_drop_on_fake_layer_and_moe_op_args():
++    with tempfile.TemporaryDirectory() as d:
++        path = _write_spec(d)
++        with _env(GLM53_EXPERT_DROP=path, GLM53_EXPERT_MASK=None):
++            plan = em.expert_drop_plan_for("model.layers.17.mlp.experts", EP, E)  # the cached plan install uses
++            assert plan.rank_count == em.expert_plan(17, EP, E, _L17_DROPPED).rank_count
++            for r in (0, 1, 2, 5, 7):
++                start, n = plan.local_range(r)
++                layer = _FakeRoutedExperts("model.layers.17.mlp.experts", r, n, plan.expert_map(r))
++                args = em.moe_op_expert_args(layer)
++                assert args == (200, n, start, start + n - 1)
++                layer.moe_op = _FakeOp(*args)
++                with contextlib.redirect_stderr(io.StringIO()):
++                    em.install_expert_mask(layer)
++                dense = em.install_expert_drop(layer)
++                assert dense.dtype == torch.int64 and dense.tolist() == plan.global_to_dense()
++                assert em.EXPERT_DENSE_ATTR in dict(layer.named_buffers())
++                assert em.EXPERT_DENSE_ATTR not in layer.state_dict()  # non-persistent
++                assert getattr(layer, em.EXPERT_DROP_PLAN_ATTR) is plan
++                assert em.local_expert_offset(layer) == start
++                inv = getattr(layer.moe_op, em.EXPERT_DROP_INVERSE_ATTR)
++                assert inv.tolist() == plan.dense_to_global() and em.EXPERT_DROP_INVERSE_ATTR in dict(
++                    layer.moe_op.named_buffers())
++                assert getattr(layer.moe_op, em.EXPERT_DROP_HIST_WIDTH_ATTR) == E
++                # re-install (weight reload) is idempotent
++                with contextlib.redirect_stderr(io.StringIO()):
++                    em.install_expert_mask(layer)
++                em.install_expert_drop(layer)
++
++            # fail-loud cases (rank 2 keeps 14)
++            start, n = plan.local_range(2)
++
++            def expect_runtime_error(build, what):
++                layer = build()
++                with contextlib.redirect_stderr(io.StringIO()):
++                    em.install_expert_mask(layer)
++                try:
++                    em.install_expert_drop(layer)
++                except RuntimeError:
++                    pass
++                else:
++                    raise AssertionError(f"{what} must fail loud")
++
++            # vLLM did not shrink the layer (patch 64 missing): 36 local instead of 20
++            expect_runtime_error(lambda: _FakeRoutedExperts("model.layers.17.mlp.experts", 2, 36), "uncut layer")
++            try:
++                em.moe_op_expert_args(_FakeRoutedExperts("model.layers.17.mlp.experts", 2, 36))
++            except RuntimeError:
++                pass
++            else:
++                raise AssertionError("moe_op_expert_args on an uncut layer must fail loud")
++            # MAX_EXPERTS_PER_SLICE slicing that would truncate the kept experts (14 = 3 x 4 + 2) must be refused;
++            # a slicing that covers every expert (14 = 2 x 7) is accepted.
++            def sliced_op(n_slice, per_group):
++                layer = _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(2))
++                layer.moe_op = _FakeOp(*em.moe_op_expert_args(layer))
++                layer.moe_op.moe_n_slice = n_slice
++                layer.moe_op.num_expert_per_group = per_group
++                return layer
++            expect_runtime_error(lambda: sliced_op(3, n // 3), "truncating expert slicing")
++            layer = sliced_op(2, n // 2)
++            with contextlib.redirect_stderr(io.StringIO()):
++                em.install_expert_mask(layer)
++            assert em.install_expert_drop(layer) is not None
++            # op built with the stock range
++            def bad_op():
++                layer = _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(2))
++                layer.moe_op = _FakeOp(E, n, 2 * n, 3 * n - 1)
++                return layer
++            expect_runtime_error(bad_op, "op with ep_rank*n range")
++            # wrong expert_map
++            expect_runtime_error(lambda: _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(3)),
++                                 "expert_map of another rank")
++            # non-grouped routing (mask/remap never applied)
++            expect_runtime_error(lambda: _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(2),
++                                                            grouped=False), "non-grouped routing")
++            # mask missing entirely
++            layer = _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(2))
++            try:
++                em.install_expert_drop(layer)
++            except RuntimeError:
++                pass
++            else:
++                raise AssertionError("drop without the mask must fail loud")
++            # mask installed but from a different spec (dropped set mismatch)
++            layer = _FakeRoutedExperts("model.layers.17.mlp.experts", 2, n, plan.expert_map(2))
++            layer.register_buffer(em.EXPERT_MASK_ATTR, em.build_expert_mask([1, 2], E, K), persistent=False)
++            try:
++                em.install_expert_drop(layer)
++            except RuntimeError:
++                pass
++            else:
++                raise AssertionError("mask/plan mismatch must fail loud")
++            # unlisted layer: no plan, buffer None, stock op args, offset ep_rank * local
++            layer = _FakeRoutedExperts("model.layers.18.mlp.experts", 3, 36)
++            with contextlib.redirect_stderr(io.StringIO()):
++                em.install_expert_mask(layer)
++            assert em.install_expert_drop(layer) is None
++            assert getattr(layer, em.EXPERT_DENSE_ATTR) is None and getattr(layer, em.EXPERT_DROP_PLAN_ATTR) is None
++            assert em.moe_op_expert_args(layer) == (E, 36, 108, 143) and em.local_expert_offset(layer) == 108
++            # methods without mask/remap refuse the drop only for dropped layers
++            em.assert_no_expert_drop(layer, "x")
++            try:
++                em.assert_no_expert_drop(_FakeRoutedExperts("model.layers.17.mlp.experts", 0, 36), "x")
++            except RuntimeError:
++                pass
++            else:
++                raise AssertionError("assert_no_expert_drop must raise for a dropped layer")
++
++
++def test_env_unset_is_a_noop():
++    with _env(GLM53_EXPERT_DROP=None, GLM53_EXPERT_MASK=None):
++        for r in range(EP):
++            layer = _FakeRoutedExperts("model.layers.17.mlp.experts", r, 36)
++            err = io.StringIO()
++            with contextlib.redirect_stderr(err):
++                assert em.install_expert_mask(layer) is None
++                assert em.install_expert_drop(layer) is None
++            assert err.getvalue() == ""
++            assert getattr(layer, em.EXPERT_DENSE_ATTR) is None
++            assert getattr(layer, em.EXPERT_DROP_PLAN_ATTR) is None
++            assert em.moe_op_expert_args(layer) == (E, 36, 36 * r, 36 * r + 35)  # stock ep_rank * local range
++            assert em.local_expert_offset(layer) == 36 * r
++            assert em.expert_map_override("model.layers.17.mlp.experts", EP, r, E) is None
++            em.assert_no_expert_drop(layer, "x")
++        assert em.EXPERT_MASK_ENV not in os.environ  # reconcile never sets the mask var without the drop var
++
++
++def _route(seed, dropped, tokens=256):
++    """Real grouped_topk with the runtime mask: global ids over the kept set only, like the HPU path."""
++    g = torch.Generator().manual_seed(seed)
++    hidden = torch.randn(tokens, 16, generator=g)
++    logits = torch.randn(tokens, E, generator=g) * 2.0
++    bias = torch.randn(E, generator=g) * 0.1
++    mask = em.build_expert_mask(dropped, E, K)
++    w, ids = grouped_topk(hidden, logits, K, True, num_expert_group=1, topk_group=1, scoring_func="sigmoid",
++                          routed_scaling_factor=RSF, e_score_correction_bias=bias, expert_mask=mask)
++    assert ids.dtype == torch.int32 and not torch.isin(ids, torch.tensor(dropped)).any()
++    return w, ids
++
++
++def test_remap_and_localize_consistency_over_ranks():
++    """For random routing over kept ids, every rank's local slot holds the right global expert, once."""
++    plan = em.expert_plan(17, EP, E, _L17_DROPPED)
++    dense_table = torch.tensor(plan.global_to_dense(), dtype=torch.int64)
++    localize = ops["_localize_routing_ids"]
++    for seed in range(3):
++        _, gids = _route(seed, _L17_DROPPED)
++        dense = dense_table[gids.long()]  # the select_experts_from_routed remap
++        assert dense.shape == gids.shape and dense.dtype == torch.int64 and (dense < plan.num_kept).all()
++        covered = torch.zeros_like(gids, dtype=torch.int64)
++        for r in range(EP):
++            emin, emax = plan.experts_range(r)
++            local, lo, hi = localize(dense, emin, emax, plan.num_kept)
++            n = plan.rank_count[r]
++            loc2glob = torch.tensor(plan.local_to_global(r))
++            slice_lo, slice_hi = plan.rank_slice[r]
++            mine = (gids >= slice_lo) & (gids < slice_hi)
++            if emin == 0:  # rank 0: early return, raw dense ids, kernel bounds by experts_max
++                assert (lo, hi) == (0, emax) and torch.equal(local, dense)
++                assert (local[mine] <= emax).all() and (local[~mine] > emax).all()
++            else:
++                assert (lo, hi) == (0, n - 1)
++                assert (local[~mine] == plan.num_kept).all()  # non-local -> sentinel above every range
++                assert (local[mine] < n).all()
++            # the local slot each rank computes holds the right global expert
++            slots = local[mine]
++            assert torch.equal(loc2glob[slots], gids[mine].long())
++            assert torch.equal(plan.expert_map(r)[gids[mine].long()].long(), slots)  # == vLLM loader slot
++            covered[mine] += 1
++        assert (covered == 1).all()  # every routed slot is served by exactly one rank
++
++
++def test_histogram_counts_global_ids_under_the_drop():
++    plan = em.expert_plan(17, EP, E, _L17_DROPPED)
++    count, rh = ops["_route_hist_count"], ops["ROUTE_HIST"]
++    dense_table = torch.tensor(plan.global_to_dense(), dtype=torch.int64)
++    _, gids = _route(7, _L17_DROPPED, tokens=128)
++    dense = dense_table[gids.long()]
++    inverse = torch.tensor(plan.dense_to_global(), dtype=torch.int64)
++    expect = torch.bincount(gids.reshape(-1).long(), minlength=E)
++    rh.update({"enabled": True, "phase": 0, "row_mask": None, "tokens": None})
++    try:
++        # dropped layer: op in the dense space (global_num_experts == |kept|) + inverse table -> global counts
++        op = _FakeOp(plan.num_kept, plan.rank_count[0], 0, plan.rank_count[0] - 1)
++        op.register_buffer(em.EXPERT_DROP_INVERSE_ATTR, inverse, persistent=False)
++        setattr(op, em.EXPERT_DROP_HIST_WIDTH_ATTR, E)
++        count(op, dense)
++        assert op._route_hist.shape == (2, E + 1) and op._route_hist_width == E
++        assert torch.equal(op._route_hist[0, :E], expect) and op._route_hist[0, E] == 0
++        assert (op._route_hist[0, _L17_DROPPED] == 0).all() and op._route_hist[1].sum() == 0
++        # a (mask-prevented) sentinel id lands in the overflow bin, never in a real expert's bin
++        rh["phase"] = 1
++        count(op, torch.full((4, K), plan.sentinel, dtype=torch.int64))
++        assert op._route_hist[1, E] == 4 * K and op._route_hist[1, :E].sum() == 0
++        # row_mask still restricts to real rows
++        rh["phase"] = 0
++        rh["row_mask"] = torch.zeros(gids.shape[0], dtype=torch.bool)
++        count(op, dense)
++        assert torch.equal(op._route_hist[0, :E], expect)
++        rh["row_mask"] = None
++        # undropped layer: unchanged patch-61 behaviour (global ids, 288 wide, no overflow bin)
++        op2 = _FakeOp(E, 36, 36, 71)
++        count(op2, gids)
++        assert op2._route_hist.shape == (2, E) and torch.equal(op2._route_hist[0], expect)
++        assert op2._route_hist_width == E
++    finally:
++        rh.update({"enabled": False, "phase": 0, "row_mask": None, "tokens": None})
++
++
++if __name__ == "__main__":
++    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
++    for name, fn in tests:
++        fn()
++        print(f"PASS {name}")
++    print(f"{len(tests)} tests passed")
+diff --git a/vllm_gaudi/extension/ops.py b/vllm_gaudi/extension/ops.py
+index 4b179b7..193fedf 100644
+--- a/vllm_gaudi/extension/ops.py
++++ b/vllm_gaudi/extension/ops.py
+@@ -668,20 +668,28 @@ class MoeMatmul(torch.nn.Module):
+ # real-token counters in ROUTE_HIST['tokens'], and reads the per-op tensors on DUMP. Counting uses the global ids
+ # before localisation, so every rank would see the same numbers. Static shapes only: index_add_ with a 0/1 weight,
+ # no boolean indexing, no host sync; the MoE op runs eagerly (patch 37), so this adds ~2 small eager ops per layer.
++# Under the physical expert drop (patch 65) the op receives DENSE kept ids; install_expert_drop then gives the op
++# an inverse table (glm53_dense_to_global, [|kept|+1]) and the true global width (glm53_hist_num_experts), so the
++# counts are still per GLOBAL id and the dumped lists keep their 288 entries. The sentinel id of a dropped expert
++# (unreachable while the mask holds) lands in one extra overflow bin that the runner reports separately.
+ ROUTE_HIST = {"enabled": False, "phase": 0, "row_mask": None, "tokens": None}
+ 
+ 
+ def _route_hist_count(op, topk_ids):
+     if not ROUTE_HIST["enabled"]:
+         return
++    inverse = getattr(op, "glm53_dense_to_global", None)
+     hist = getattr(op, "_route_hist", None)
+     if hist is None:
+-        n = int(getattr(op, "global_num_experts", 0) or 0)
++        n = int(getattr(op, "glm53_hist_num_experts", 0) or getattr(op, "global_num_experts", 0) or 0)
+         if n <= 0:
+             return
+-        hist = torch.zeros(2, n, dtype=torch.int64, device=topk_ids.device)
++        hist = torch.zeros(2, n + (1 if inverse is not None else 0), dtype=torch.int64, device=topk_ids.device)
+         op._route_hist = hist
++        op._route_hist_width = n
+     ids = topk_ids.reshape(-1).to(torch.int64)
++    if inverse is not None:
++        ids = inverse[ids]
+     rows, k = int(topk_ids.shape[0]), int(topk_ids.shape[-1])
+     mask = ROUTE_HIST["row_mask"]
+     if mask is None or int(mask.numel()) != rows:
+diff --git a/vllm_gaudi/ops/hpu_compressed_tensors.py b/vllm_gaudi/ops/hpu_compressed_tensors.py
+index c87913f..73159c5 100644
+--- a/vllm_gaudi/ops/hpu_compressed_tensors.py
++++ b/vllm_gaudi/ops/hpu_compressed_tensors.py
+@@ -59,7 +59,8 @@ from vllm_gaudi.ops.hpu_fused_moe import (
+     _normalize_moe_activation,
+     select_experts_from_routed,
+ )
+-from vllm_gaudi.ops.hpu_expert_mask import install_expert_mask
++from vllm_gaudi.ops.hpu_expert_mask import (assert_no_expert_drop, install_expert_drop, install_expert_mask,
++                                            moe_op_expert_args)
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_tensor
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizeMethodBase, )
+@@ -438,14 +439,12 @@ class HPUCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+         #NOTE: This method is called after the weights are loaded.
+         # super().process_weights_after_loading(layer)
+         # custom handling for HPU
+-        num_experts = layer.local_num_experts
+-        ep_shift = layer.moe_config.ep_rank * num_experts
+-
+-        experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
++        # See hpu_fp8.HPUFp8MoEMethod.process_weights_after_loading (GLM53_EXPERT_DROP-aware expert range).
++        global_num_experts, num_experts, experts_min, experts_max = moe_op_expert_args(layer)
+ 
+         if self.block_quant and not envs.VLLM_HPU_FORCE_CHANNEL_FP8:
+             layer.moe_op = VllmMixtureOfExpertsOpFP8(
+-                layer.global_num_experts,
++                global_num_experts,
+                 num_experts,
+                 experts_min,
+                 experts_max,
+@@ -453,7 +452,7 @@ class HPUCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+             )
+         else:
+             layer.moe_op = VllmMixtureOfExpertsOpFP8PerChannel(
+-                layer.global_num_experts,
++                global_num_experts,
+                 num_experts,
+                 experts_min,
+                 experts_max,
+@@ -508,6 +507,7 @@ class HPUCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
+         # Opt-in GLM53_EXPERT_MASK: see hpu_fp8.HPUFp8MoEMethod.process_weights_after_loading.
+         install_expert_mask(layer)
++        install_expert_drop(layer)
+         return
+ 
+     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
+@@ -964,6 +964,9 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
+                                                    requires_grad=False)
+ 
+         # Initialize HPU MoE op
++        # WNA16 installs neither the routing mask nor the dense remap: refuse GLM53_EXPERT_DROP instead of
++        # misrouting (fail loud at load).
++        assert_no_expert_drop(layer, "HPUCompressedTensorsWNA16MoEMethod")
+         num_experts = layer.local_num_experts
+         ep_shift = layer.moe_config.ep_rank * num_experts
+ 
+diff --git a/vllm_gaudi/ops/hpu_expert_mask.py b/vllm_gaudi/ops/hpu_expert_mask.py
+index db15398..8b56b72 100644
+--- a/vllm_gaudi/ops/hpu_expert_mask.py
++++ b/vllm_gaudi/ops/hpu_expert_mask.py
+@@ -18,6 +18,20 @@ Design constraints honoured here:
+   batch-shape change;
+ * every rank builds the identical mask from the same file (routing is replicated across EP ranks), so the
+   expert outputs all-reduced over the EP group stay consistent.
++
++Physical expert drop (``GLM53_EXPERT_DROP=<same path.json>``, patches 64/65)
++----------------------------------------------------------------------------
++The same file additionally drives a physical drop: the dropped experts' weights are never allocated (vLLM's
++``ExpertMapManager`` takes this module's per-layer plan through ``set_expert_map_override``, so ``expert_map``
++holds -1 for them and ``create_weights`` sizes ``w13/w2`` and their scales to the rank's kept count), each rank's
++HPU fused op is built for its kept experts only, and the routing ids leaving ``select_experts_from_routed`` are
++remapped from the 288-wide global space into the dense kept-id space. Dense id d(g) = position of global id g
++among the layer's kept ids in ascending order; because every rank owns a contiguous global slice, rank r's kept
++experts occupy the contiguous dense range ``[start_r, start_r + n_r)`` (``start_r`` = prefix sum of the kept
++counts of ranks 0..r-1), which is what ``_localize_routing_ids`` needs. ``n_r`` differs per rank and per layer.
++Dropping without the mask is impossible: ``GLM53_EXPERT_DROP`` installs the mask from the same file (or fails if
++``GLM53_EXPERT_MASK`` names a different one), so a dropped expert is never selected and its dense sentinel id
++``|kept|`` never reaches the kernel; ``install_expert_drop`` verifies mask, weights and op against the plan.
+ """
+ from __future__ import annotations
+ 
+@@ -32,6 +46,11 @@ import torch
+ 
+ EXPERT_MASK_ENV = "GLM53_EXPERT_MASK"
+ EXPERT_MASK_ATTR = "glm53_expert_mask"
++EXPERT_DROP_ENV = "GLM53_EXPERT_DROP"
++EXPERT_DENSE_ATTR = "glm53_dense_ids"  # per-layer [num_experts] int64 buffer: global id -> dense kept id
++EXPERT_DROP_PLAN_ATTR = "glm53_expert_drop"  # ExpertDropPlan (or None) attached to the layer at load
++EXPERT_DROP_INVERSE_ATTR = "glm53_dense_to_global"  # on the MoE op: [|kept|+1] int64, sentinel -> overflow bin
++EXPERT_DROP_HIST_WIDTH_ATTR = "glm53_hist_num_experts"  # on the MoE op: the true global count (288)
+ 
+ _LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+ 
+@@ -125,6 +144,7 @@ def install_expert_mask(layer: torch.nn.Module) -> torch.Tensor | None:
+     layer.__dict__.pop(EXPERT_MASK_ATTR, None)
+     layer._buffers.pop(EXPERT_MASK_ATTR, None)
+ 
++    reconcile_drop_env()  # GLM53_EXPERT_DROP implies GLM53_EXPERT_MASK from the same file
+     path = os.environ.get(EXPERT_MASK_ENV)
+     if not path:
+         layer.register_buffer(EXPERT_MASK_ATTR, None, persistent=False)
+@@ -155,3 +175,300 @@ def install_expert_mask(layer: torch.nn.Module) -> torch.Tensor | None:
+           f"(kept {num_experts - len(dropped)}/{num_experts}, rank {rank}, {path})",
+           file=sys.stderr, flush=True)
+     return mask
++
++
++# --- physical expert drop (GLM53_EXPERT_DROP) -------------------------------------------------------------------
++
++
++def reconcile_drop_env() -> str | None:
++    """Return the drop file path (or None) and force ``GLM53_EXPERT_MASK`` to the same file.
++
++    Dropping without the runtime mask must be impossible: the mask is what keeps a dropped expert out of the
++    top-k, so the drop env var installs the mask from its own file, and a mask env var naming a different file
++    is an error rather than a silent precedence rule.
++    """
++    drop = os.environ.get(EXPERT_DROP_ENV)
++    if not drop:
++        return None
++    mask = os.environ.get(EXPERT_MASK_ENV)
++    if mask and os.path.realpath(mask) != os.path.realpath(drop):
++        raise RuntimeError(f"{EXPERT_DROP_ENV}={drop} but {EXPERT_MASK_ENV}={mask}: the physical drop must use the "
++                           "mask from the same file (unset the mask var or point both at one file)")
++    if not mask:
++        os.environ[EXPERT_MASK_ENV] = drop
++    return drop
++
++
++def _linear_slices(num_experts: int, ep_size: int) -> list[tuple[int, int]]:
++    """Global id slice [lo, hi) per EP rank, vLLM's linear placement (expert_map_manager.determine_expert_map)."""
++    base, rem = divmod(num_experts, ep_size)
++    out = []
++    for r in range(ep_size):
++        lo = r * base + min(r, rem)
++        out.append((lo, lo + base + (1 if r < rem else 0)))
++    return out
++
++
++class ExpertDropPlan:
++    """Per-layer physical drop plan shared by all EP ranks (every rank computes the identical plan).
++
++    A plain class (not a dataclass): the unit tests load this module by file path, where dataclass annotation
++    resolution needs the module in ``sys.modules``.
++    """
++    __slots__ = ("layer_idx", "num_experts", "ep_size", "dropped", "kept", "rank_slice", "rank_start", "rank_count")
++
++    def __init__(self, layer_idx: int, num_experts: int, ep_size: int, dropped: tuple[int, ...],
++                 kept: tuple[int, ...], rank_slice: tuple[tuple[int, int], ...], rank_start: tuple[int, ...],
++                 rank_count: tuple[int, ...]):
++        self.layer_idx = layer_idx
++        self.num_experts = num_experts  # true global count (gate width), 288
++        self.ep_size = ep_size
++        self.dropped = dropped  # sorted global ids
++        self.kept = kept  # sorted global ids; dense id of kept[i] is i
++        self.rank_slice = rank_slice  # original global slice [lo, hi) per rank
++        self.rank_start = rank_start  # first dense id per rank
++        self.rank_count = rank_count  # n_r: kept experts per rank
++
++    def __repr__(self) -> str:
++        return (f"ExpertDropPlan(layer={self.layer_idx}, kept={self.num_kept}/{self.num_experts}, "
++                f"rank_start={self.rank_start}, rank_count={self.rank_count})")
++
++    @property
++    def num_kept(self) -> int:
++        return len(self.kept)
++
++    @property
++    def sentinel(self) -> int:
++        """Dense id given to a dropped expert: above every rank's range, so the kernel drops it."""
++        return self.num_kept
++
++    def global_to_dense(self) -> list[int]:
++        table = [self.sentinel] * self.num_experts
++        for d, g in enumerate(self.kept):
++            table[g] = d
++        return table
++
++    def dense_to_global(self) -> list[int]:
++        """Inverse table for the routing histogram; the sentinel maps to an overflow bin ``num_experts``."""
++        return list(self.kept) + [self.num_experts]
++
++    def local_range(self, rank: int) -> tuple[int, int]:
++        """(start_r, n_r): rank's dense range is [start_r, start_r + n_r)."""
++        return self.rank_start[rank], self.rank_count[rank]
++
++    def experts_range(self, rank: int) -> tuple[int, int]:
++        """(experts_min, experts_max) for the HPU fused op, inclusive, in the dense id space."""
++        start, n = self.local_range(rank)
++        return start, start + n - 1
++
++    def local_to_global(self, rank: int) -> tuple[int, ...]:
++        """Global id held by each local weight slot of ``rank`` (slot i <-> dense id start_r + i)."""
++        start, n = self.local_range(rank)
++        return self.kept[start:start + n]
++
++    def expert_map(self, rank: int, device: torch.device | str = "cpu") -> torch.Tensor:
++        """vLLM expert_map for ``rank``: [num_experts] int32, local slot for kept experts of its slice, else -1.
++
++        Built on CPU by default (explicitly, not on the ambient default device) so the load-time comparison in
++        ``install_expert_drop`` stays a same-device ``torch.equal`` even if a loader keeps a device context open.
++        """
++        m = torch.full((self.num_experts, ), -1, dtype=torch.int32, device=device)
++        for slot, g in enumerate(self.local_to_global(rank)):
++            m[g] = slot
++        return m
++
++
++def expert_plan(layer_idx: int, ep_size: int, num_experts: int, dropped) -> ExpertDropPlan:
++    """Build the plan for one layer; raises ``ValueError`` when a rank would keep no expert.
++
++    ``VllmMixtureOfExpertsOp*`` builds one weight-list entry per local expert and
++    ``fp8_channel_moe_prepare_weights`` iterates over them, so an empty rank is unrepresentable: the JSON must
++    keep at least one expert in every rank's slice of every listed layer.
++    """
++    dropped = tuple(sorted(set(int(i) for i in dropped)))
++    if ep_size < 1:
++        raise ValueError(f"expert drop: ep_size must be >= 1, got {ep_size}")
++    if any(i < 0 or i >= num_experts for i in dropped):
++        raise ValueError(f"expert drop: layer {layer_idx}: ids must lie in [0, {num_experts}), got {dropped}")
++    dropped_set = set(dropped)
++    kept = tuple(g for g in range(num_experts) if g not in dropped_set)
++    slices = _linear_slices(num_experts, ep_size)
++    counts, starts, start = [], [], 0
++    for r, (lo, hi) in enumerate(slices):
++        n_r = sum(1 for g in kept if lo <= g < hi)
++        if n_r == 0:
++            raise ValueError(f"expert drop: layer {layer_idx}: rank {r} (global experts [{lo}, {hi})) would keep 0 "
++                             "experts; the fused op cannot represent an empty rank, keep at least one per rank")
++        starts.append(start)
++        counts.append(n_r)
++        start += n_r
++    plan = ExpertDropPlan(int(layer_idx), int(num_experts), int(ep_size), dropped, kept, tuple(slices),
++                          tuple(starts), tuple(counts))
++    # Contiguity by construction: kept is ascending and the slices are ascending in rank, so the dense ids of
++    # rank r's kept experts are exactly [start_r, start_r + n_r). Check it once rather than trust the argument.
++    g2d = plan.global_to_dense()
++    for r, (lo, hi) in enumerate(slices):
++        ds = [g2d[g] for g in range(lo, hi) if g not in dropped_set]
++        assert ds == list(range(starts[r], starts[r] + counts[r])), (r, ds)
++    return plan
++
++
++@functools.lru_cache(maxsize=256)
++def _cached_plan(path: str, layer_idx: int, ep_size: int, num_experts: int) -> ExpertDropPlan | None:
++    dropped = load_expert_mask_spec(path).get(layer_idx)
++    if not dropped:
++        return None
++    return expert_plan(layer_idx, ep_size, num_experts, dropped)
++
++
++def expert_drop_plan_for(layer_name: str | None, ep_size: int, num_experts: int) -> ExpertDropPlan | None:
++    """The layer's plan, or None when the drop is off or the layer is not listed (left dense, e.g. MTP 45)."""
++    path = reconcile_drop_env()
++    if not path:
++        return None
++    layer_idx = layer_index_from_name(layer_name)
++    if layer_idx is None:
++        return None
++    return _cached_plan(path, layer_idx, int(ep_size), int(num_experts))
++
++
++def expert_map_override(layer_name: str | None, ep_size: int, ep_rank: int,
++                        global_num_experts: int) -> tuple[int, torch.Tensor] | None:
++    """vLLM ``ExpertMapManager`` hook (patch 64): this rank's (local_num_experts, expert_map) for a dropped layer.
++
++    Returning None keeps vLLM's standard placement, so with the env var unset nothing changes.
++    """
++    plan = expert_drop_plan_for(layer_name, ep_size, global_num_experts)
++    if plan is None:
++        return None
++    start, n_r = plan.local_range(ep_rank)
++    lo, hi = plan.rank_slice[ep_rank]
++    # print, not logger: logger.info from these modules does not reach the serve log.
++    print(f"[EXPERT-DROP] layer {plan.layer_idx} rank {ep_rank}: keeps {n_r} of {hi - lo} local "
++          f"(dense [{start}, {start + n_r})), global kept {plan.num_kept} of {plan.num_experts}",
++          file=sys.stderr, flush=True)
++    return n_r, plan.expert_map(ep_rank)
++
++
++def _register_override() -> bool:
++    try:
++        from vllm.model_executor.layers.fused_moe.expert_map_manager import set_expert_map_override
++    except ImportError:  # vLLM tree without patch 64: install_expert_drop fails loud if a drop is requested
++        return False
++    set_expert_map_override(expert_map_override)
++    return True
++
++
++_OVERRIDE_REGISTERED = _register_override()
++
++
++def moe_op_expert_args(layer: torch.nn.Module) -> tuple[int, int, int, int]:
++    """(global_num_experts, num_experts, experts_min, experts_max) for building the HPU fused MoE op.
++
++    Without a drop plan this is the stock ``ep_rank * local_num_experts`` contiguous range over the true global
++    count. With a plan the op lives in the dense kept-id space: ``|kept|`` experts globally, ``n_r`` locally at
++    ``[start_r, start_r + n_r - 1]``.
++    """
++    num_experts = int(layer.local_num_experts)
++    ep_rank = int(layer.moe_config.ep_rank)
++    plan = expert_drop_plan_for(getattr(layer, "layer_name", None), layer.moe_config.ep_size,
++                                layer.global_num_experts)
++    if plan is None:
++        ep_shift = ep_rank * num_experts
++        return int(layer.global_num_experts), num_experts, ep_shift, ep_shift + num_experts - 1
++    start, n_r = plan.local_range(ep_rank)
++    if num_experts != n_r:
++        raise RuntimeError(f"{EXPERT_DROP_ENV}: layer {plan.layer_idx} rank {ep_rank}: local_num_experts is "
++                           f"{num_experts} but the plan keeps {n_r}; the vLLM tree did not apply the expert-map "
++                           f"override (patch 64 missing or set_expert_map_override not reached; "
++                           f"registered={_OVERRIDE_REGISTERED})")
++    return plan.num_kept, n_r, start, start + n_r - 1
++
++
++def assert_no_expert_drop(layer: torch.nn.Module, method: str) -> None:
++    """MoE methods that neither install the mask nor remap ids must refuse a drop instead of misrouting."""
++    if expert_drop_plan_for(getattr(layer, "layer_name", None), layer.moe_config.ep_size,
++                            layer.global_num_experts) is not None:
++        raise RuntimeError(f"{EXPERT_DROP_ENV}: {method} is not wired for the physical expert drop "
++                           f"(layer {getattr(layer, 'layer_name', '?')})")
++
++
++def local_expert_offset(layer: torch.nn.Module) -> int:
++    """First routing id (dense under a drop, global otherwise) owned by this rank; forward-time helper."""
++    plan = getattr(layer, EXPERT_DROP_PLAN_ATTR, None)
++    if plan is not None:
++        return int(plan.rank_start[int(layer.moe_config.ep_rank)])
++    return int(layer.moe_config.ep_rank * layer.local_num_experts)
++
++
++def install_expert_drop(layer: torch.nn.Module) -> torch.Tensor | None:
++    """Attach ``layer.glm53_dense_ids`` (buffer or None) and verify the layer matches its plan.
++
++    Call after ``install_expert_mask`` and after ``layer.moe_op`` is built. Checks, all fail-loud:
++    the vLLM side allocated exactly ``n_r`` expert rows (patch 64 applied), the mask drops exactly the plan's
++    experts (routing guarantee), the op's expert range is the plan's dense range, and the routing goes through
++    the grouped-top-k path that applies mask and remap. Also hands the op the inverse table so the patch-61
++    histogram keeps counting global ids.
++    """
++    layer.__dict__.pop(EXPERT_DENSE_ATTR, None)
++    layer._buffers.pop(EXPERT_DENSE_ATTR, None)
++    plan = expert_drop_plan_for(getattr(layer, "layer_name", None), layer.moe_config.ep_size,
++                                layer.global_num_experts)
++    setattr(layer, EXPERT_DROP_PLAN_ATTR, plan)
++    if plan is None:
++        layer.register_buffer(EXPERT_DENSE_ATTR, None, persistent=False)
++        return None
++
++    ep_rank = int(layer.moe_config.ep_rank)
++    start, n_r = plan.local_range(ep_rank)
++    tag = f"{EXPERT_DROP_ENV}: layer {plan.layer_idx} rank {ep_rank}"
++    if int(layer.local_num_experts) != n_r:
++        raise RuntimeError(f"{tag}: local_num_experts {layer.local_num_experts} != planned {n_r} (patch 64 not "
++                           f"applied; registered={_OVERRIDE_REGISTERED})")
++    for name in ("w13_weight", "w2_weight"):
++        w = getattr(layer, name, None)
++        if isinstance(w, torch.Tensor) and w.dim() > 0 and w.shape[0] not in (0, n_r):
++            raise RuntimeError(f"{tag}: {name} has {w.shape[0]} expert rows, planned {n_r}")
++    expert_map = getattr(layer, "expert_map", None)
++    if expert_map is not None:
++        if not torch.equal(expert_map.detach().to("cpu", torch.int32), plan.expert_map(ep_rank, device="cpu")):
++            raise RuntimeError(f"{tag}: layer.expert_map does not match the plan")
++    if not getattr(layer, "use_grouped_topk", False):
++        raise RuntimeError(f"{tag}: the drop needs the grouped-top-k routing path (mask + remap)")
++    mask = getattr(layer, EXPERT_MASK_ATTR, None)
++    if mask is None:
++        raise RuntimeError(f"{tag}: runtime mask not installed; the drop requires the mask from the same file")
++    masked = tuple(int(i) for i in (mask.detach().to("cpu") != 0).nonzero().flatten().tolist())
++    if masked != plan.dropped:
++        raise RuntimeError(f"{tag}: mask drops {masked} but the plan drops {plan.dropped}")
++
++    op = getattr(layer, "moe_op", None)
++    if op is not None:
++        want = (n_r, start, start + n_r - 1)
++        got = (int(op.num_experts), int(op.experts_min), int(op.experts_max))
++        if got != want:
++            raise RuntimeError(f"{tag}: moe_op (num_experts, experts_min, experts_max) {got} != planned {want}")
++        gne = getattr(op, "global_num_experts", None)
++        if gne is not None and int(gne) != plan.num_kept:
++            raise RuntimeError(f"{tag}: moe_op.global_num_experts {gne} != kept {plan.num_kept}")
++        # MAX_EXPERTS_PER_SLICE > 0 makes VllmMixtureOfExpertsOpBase slice the expert list into
++        # num_experts // moe_n_slice groups and silently skip the remainder; n_r is not uniform under a drop,
++        # so refuse any slicing that would not cover every kept expert.
++        n_slice = int(getattr(op, "moe_n_slice", 1) or 1)
++        per_group = int(getattr(op, "num_expert_per_group", n_r) or n_r)
++        if n_slice * per_group != n_r:
++            raise RuntimeError(f"{tag}: moe_op slicing (MAX_EXPERTS_PER_SLICE) covers {n_slice} x {per_group} "
++                               f"experts but the rank keeps {n_r}; unset MAX_EXPERTS_PER_SLICE or make every n_r "
++                               "divisible by the slice count")
++        inverse = torch.tensor(plan.dense_to_global(), dtype=torch.int64, device=_layer_device(layer))
++        if isinstance(op, torch.nn.Module):  # a buffer follows model.to(device); a plain attribute would not
++            op.__dict__.pop(EXPERT_DROP_INVERSE_ATTR, None)
++            op._buffers.pop(EXPERT_DROP_INVERSE_ATTR, None)
++            op.register_buffer(EXPERT_DROP_INVERSE_ATTR, inverse, persistent=False)
++        else:
++            setattr(op, EXPERT_DROP_INVERSE_ATTR, inverse)
++        setattr(op, EXPERT_DROP_HIST_WIDTH_ATTR, plan.num_experts)
++
++    dense = torch.tensor(plan.global_to_dense(), dtype=torch.int64, device=_layer_device(layer))
++    layer.register_buffer(EXPERT_DENSE_ATTR, dense, persistent=False)
++    return dense
+diff --git a/vllm_gaudi/ops/hpu_fp8.py b/vllm_gaudi/ops/hpu_fp8.py
+index 464f6ec..6b0d3c3 100644
+--- a/vllm_gaudi/ops/hpu_fp8.py
++++ b/vllm_gaudi/ops/hpu_fp8.py
+@@ -15,7 +15,7 @@ import vllm_gaudi.extension.ops as hpu_ops
+ from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
+ from vllm_gaudi.extension.runtime import get_config
+ from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
+-from vllm_gaudi.ops.hpu_expert_mask import install_expert_mask
++from vllm_gaudi.ops.hpu_expert_mask import install_expert_drop, install_expert_mask, moe_op_expert_args
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
+ 
+ from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
+@@ -283,10 +283,9 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+         super().create_weights(*args, **kwargs)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        num_experts = layer.local_num_experts
+-        ep_shift = layer.moe_config.ep_rank * num_experts
+-
+-        experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
++        # (global, local, experts_min, experts_max): the stock contiguous slice ep_rank * local_num_experts, or
++        # under GLM53_EXPERT_DROP the dense kept range (|kept| global, n_r local at [start_r, start_r + n_r - 1]).
++        global_num_experts, num_experts, experts_min, experts_max = moe_op_expert_args(layer)
+         if layer.moe_config.dp_size > 1 and self.use_dispatch_fn:
+             dispatch_fn = partial(dispatch_hidden_states, is_sequence_parallel=layer.moe_config.is_sequence_parallel)
+         else:
+@@ -294,7 +293,7 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+ 
+         if self.block_quant and not envs.VLLM_HPU_FORCE_CHANNEL_FP8:
+             layer.moe_op = VllmMixtureOfExpertsOpFP8(
+-                layer.global_num_experts,
++                global_num_experts,
+                 num_experts,
+                 experts_min,
+                 experts_max,
+@@ -302,7 +301,7 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+             )
+         else:
+             layer.moe_op = VllmMixtureOfExpertsOpFP8PerChannel(
+-                layer.global_num_experts,
++                global_num_experts,
+                 num_experts,
+                 experts_min,
+                 experts_max,
+@@ -324,6 +323,9 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
+         # Opt-in GLM53_EXPERT_MASK: per-layer routing mask buffer, built once here (after load, before
+         # warmup/compile) and consumed by select_experts_from_routed in apply_monolithic.
+         install_expert_mask(layer)
++        # Opt-in GLM53_EXPERT_DROP: verifies weights/mask/op against the per-layer plan and installs the
++        # global -> dense routing table used by select_experts_from_routed.
++        install_expert_drop(layer)
+ 
+     def apply_monolithic(
+         self,
+diff --git a/vllm_gaudi/ops/hpu_fused_moe.py b/vllm_gaudi/ops/hpu_fused_moe.py
+index 3528c90..1b2d8eb 100644
+--- a/vllm_gaudi/ops/hpu_fused_moe.py
++++ b/vllm_gaudi/ops/hpu_fused_moe.py
+@@ -29,7 +29,9 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+     ZeroExpertRouter, )
+ import vllm_gaudi.envs as gaudi_envs
+ from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
+-from vllm_gaudi.ops.hpu_expert_mask import EXPERT_MASK_ATTR, EXPERT_MASK_ENV, install_expert_mask
++from vllm_gaudi.ops.hpu_expert_mask import (EXPERT_DENSE_ATTR, EXPERT_DROP_ENV, EXPERT_MASK_ATTR, EXPERT_MASK_ENV,
++                                            install_expert_drop, install_expert_mask, local_expert_offset,
++                                            moe_op_expert_args)
+ from vllm_gaudi.extension.runtime import get_config
+ from vllm_gaudi.utils import has_quant_config
+ from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
+@@ -112,9 +114,10 @@ def _unfused_swigluoai_moe(
+     """
+     w13 = layer.w13_weight  # [E_local, 2*I, H]
+     w2 = layer.w2_weight  # [E_local, H, I]
+-    # First global expert id owned by this (EP) rank; matches the experts_min
+-    # that process_weights_after_loading passes to VllmMixtureOfExpertsOp.
+-    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
++    # First expert id owned by this (EP) rank; matches the experts_min that
++    # process_weights_after_loading passes to VllmMixtureOfExpertsOp (dense
++    # start_r under GLM53_EXPERT_DROP, ep_rank * local_num_experts otherwise).
++    experts_min = local_expert_offset(layer)
+ 
+     e_local = w13.shape[0]
+     d = w13.shape[1] // 2
+@@ -227,7 +230,7 @@ def _gather_swigluoai_moe(
+     """
+     w13 = layer.w13_weight  # [E_local, 2*I, H]
+     w2 = layer.w2_weight  # [E_local, H, I]
+-    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
++    experts_min = local_expert_offset(layer)
+ 
+     e_local = w13.shape[0]
+     d = w13.shape[1] // 2
+@@ -379,8 +382,15 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
+                            "never had install_expert_mask() applied (MoE method not wired for the mask)")
+     expert_mask = getattr(layer, EXPERT_MASK_ATTR, None)
+     mask_kwargs = {"expert_mask": expert_mask} if expert_mask is not None else {}
+-
+-    return select_experts(
++    # Opt-in physical drop (GLM53_EXPERT_DROP): the op holds only the kept experts, addressed by dense kept ids
++    # (see hpu_expert_mask), so the global ids from the router are remapped through a per-layer [num_experts]
++    # int64 buffer: one static-shape gather, no extra guards. Same absent-attribute fail-loud rule as the mask.
++    if EXPERT_DROP_ENV in os.environ and not hasattr(layer, EXPERT_DENSE_ATTR):
++        raise RuntimeError(f"{EXPERT_DROP_ENV} is set but {type(layer).__name__} {getattr(layer, 'layer_name', '?')} "
++                           "never had install_expert_drop() applied (MoE method not wired for the drop)")
++    dense_ids = getattr(layer, EXPERT_DENSE_ATTR, None)
++
++    topk_weights, topk_ids = select_experts(
+         hidden_states=hidden_states,
+         router_logits=router_logits,
+         top_k=layer.top_k,
+@@ -394,6 +404,11 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
+         e_score_correction_bias=layer.e_score_correction_bias,
+         **mask_kwargs,
+     )
++    if dense_ids is not None:
++        # cpu_moe returns int32 ids; index with int64. Dropped experts cannot appear here (the mask
++        # excludes them), so the sentinel |kept| in the table is only a safety net for the kernel.
++        topk_ids = dense_ids[topk_ids.long()]
++    return topk_weights, topk_ids
+ 
+ 
+ @UnquantizedFusedMoEMethod.register_oot
+@@ -437,12 +452,11 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         super().process_weights_after_loading(layer)
+         # custom handling for HPU
+-        num_experts = layer.local_num_experts
+-        ep_shift = layer.moe_config.ep_rank * num_experts
++        # (global, local, experts_min, experts_max): the stock contiguous slice, or the dense kept range under
++        # GLM53_EXPERT_DROP (hpu_expert_mask.moe_op_expert_args).
++        global_num_experts, num_experts, experts_min, experts_max = moe_op_expert_args(layer)
+         has_bias = hasattr(layer, "w13_bias") and hasattr(layer, "w2_bias")
+ 
+-        experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
+-
+         if layer.moe_config.dp_size > 1 and self.use_dispatch_fn:
+             dispatch_fn = partial(dispatch_hidden_states, is_sequence_parallel=layer.moe_config.is_sequence_parallel)
+         else:
+@@ -457,7 +471,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         cache_weight_lists = bool(is_bf16 and is_unquantized)
+ 
+         # Pass cache flag into moe_op (requires ops.py __init__ signature update)
+-        layer.moe_op = VllmMixtureOfExpertsOp(layer.global_num_experts, num_experts, experts_min, experts_max, bias,
++        layer.moe_op = VllmMixtureOfExpertsOp(global_num_experts, num_experts, experts_min, experts_max, bias,
+                                               dispatch_fn)
+ 
+         for expert_id in range(layer.local_num_experts):
+@@ -471,6 +485,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         if cache_weight_lists and hasattr(layer.moe_op, "_cache_weight_lists"):
+             layer.moe_op._cache_weight_lists()
+         install_expert_mask(layer)
++        install_expert_drop(layer)
+ 
+     def apply_monolithic(
+         self,
+diff --git a/vllm_gaudi/ops/hpu_moe_combine.py b/vllm_gaudi/ops/hpu_moe_combine.py
+index d2f88e7..2750476 100644
+--- a/vllm_gaudi/ops/hpu_moe_combine.py
++++ b/vllm_gaudi/ops/hpu_moe_combine.py
+@@ -34,6 +34,8 @@ from __future__ import annotations
+ 
+ import torch
+ 
++from vllm_gaudi.ops.hpu_expert_mask import local_expert_offset
++
+ 
+ def _dynamic_quant(data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     # import lazily to avoid pulling heavy deps at module import
+@@ -72,8 +74,9 @@ def gather_silu_fp8_moe(
+     # topk_ids are GLOBAL expert ids; remap to this rank's local ids and mask
+     # experts owned by other EP ranks (they contribute +0.0 to this rank's
+     # partial, which is then reduce-scattered by the runner). At TP=1
+-    # ep_rank=0 -> experts_min=0, identical to the unremapped path.
+-    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
++    # ep_rank=0 -> experts_min=0, identical to the unremapped path. Under
++    # GLM53_EXPERT_DROP the ids are dense and the offset is the rank's start_r.
++    experts_min = local_expert_offset(layer)
+     local_ids = topk_ids - experts_min  # [T,K]
+     in_range = (local_ids >= 0) & (local_ids < local_experts)
+     safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+diff --git a/vllm_gaudi/ops/hpu_moe_gather_fast.py b/vllm_gaudi/ops/hpu_moe_gather_fast.py
+index b8a74bb..5279f5d 100644
+--- a/vllm_gaudi/ops/hpu_moe_gather_fast.py
++++ b/vllm_gaudi/ops/hpu_moe_gather_fast.py
+@@ -10,6 +10,8 @@ silu*up and the weighted sum. Numerics: same per-channel FP8 weights as the stoc
+ """
+ import torch
+ 
++from vllm_gaudi.ops.hpu_expert_mask import local_expert_offset
++
+ 
+ def pack_expert_weights(layer) -> None:
+     """Build layer.moe_packed [E, P] fp8 view-as-uint8? No: keep fp8 dtype; plus packed per-channel scales."""
+@@ -29,7 +31,7 @@ def pack_expert_weights(layer) -> None:
+ def gather_silu_fp8_moe_fast(layer, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
+     E, H, I = layer.moe_packed_dims
+     tokens, K = topk_ids.shape
+-    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
++    experts_min = local_expert_offset(layer)  # dense start_r under GLM53_EXPERT_DROP
+     local_ids = topk_ids - experts_min
+     in_range = (local_ids >= 0) & (local_ids < E)
+     safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+diff --git a/vllm_gaudi/ops/hpu_mxfp4.py b/vllm_gaudi/ops/hpu_mxfp4.py
+index 3b3c24e..c00a89a 100644
+--- a/vllm_gaudi/ops/hpu_mxfp4.py
++++ b/vllm_gaudi/ops/hpu_mxfp4.py
+@@ -22,6 +22,7 @@ from vllm_gaudi.ops.hpu_fused_moe import (
+     _normalize_moe_activation,
+     select_experts_from_routed,
+ )
++from vllm_gaudi.ops.hpu_expert_mask import assert_no_expert_drop
+ from vllm_gaudi.v1.worker.hpu_dp_utils import (
+     dispatch_hidden_states,
+     dispatch_tensor,
+@@ -66,6 +67,8 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
+ 
+     def process_weights_after_loading(self, layer) -> None:
+         """Build VllmMixtureOfExpertsOpMXFP4 from the uint8 params loaded by upstream."""
++        # MXFP4 installs neither the routing mask nor the dense remap: refuse GLM53_EXPERT_DROP (fail loud).
++        assert_no_expert_drop(layer, "HPUMxfp4MoEMethod")
+         num_experts = layer.local_num_experts
+         ep_shift = layer.moe_config.ep_rank * num_experts
+         experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 76eab40..b399e86 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -3941,7 +3941,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                     continue
+                 mo = re.search(r"layers\.(\d+)\.", name)
+                 hc = h.cpu().tolist()
+-                layers[mo.group(1) if mo else name] = {"prefill": hc[0], "decode": hc[1]}
++                entry = {"prefill": hc[0], "decode": hc[1]}
++                # Physical expert drop (patch 65): the op counts through an inverse table into the true global
++                # width plus one overflow bin for the dense sentinel; keep the lists 288 wide for the analyzer.
++                width = getattr(m, "_route_hist_width", None)
++                if width is not None and len(hc[0]) > width:
++                    entry = {"prefill": hc[0][:width], "decode": hc[1][:width],
++                             "dropped_hits": {"prefill": hc[0][width], "decode": hc[1][width]}}
++                layers[mo.group(1) if mo else name] = entry
+             toks = [int(t.cpu()) for t in _ext_ops.ROUTE_HIST["tokens"]]
+             self._route_hist_dump_n += 1
+             out = {"schema": 1, "rank": self._route_hist_rank, "layers": layers,
+-- 
+2.43.0
+

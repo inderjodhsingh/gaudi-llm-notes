@@ -1,0 +1,27 @@
+From 8896868ce29da8fef72498bd89cb05f7c8ab11dd Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 02:31:00 +0000
+Subject: [PATCH] HPU causal conv prefill: NaN-safe initial-state masking
+ (where instead of multiply)
+
+---
+ vllm_gaudi/ops/causal_conv1d_pytorch.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_gaudi/ops/causal_conv1d_pytorch.py b/vllm_gaudi/ops/causal_conv1d_pytorch.py
+index 506b43a..19fb30e 100644
+--- a/vllm_gaudi/ops/causal_conv1d_pytorch.py
++++ b/vllm_gaudi/ops/causal_conv1d_pytorch.py
+@@ -269,7 +269,8 @@ def hpu_causal_conv1d_fn(
+             mask = his[:padded_batch].reshape(-1, 1, 1).to(dtype=raw_states.dtype)
+             # Also mask out padding slots to avoid reading stale state.
+             mask = mask * valid_mask_prefill.reshape(-1, 1, 1).to(dtype=mask.dtype)
+-            init_states = raw_states * mask
++            # where (not multiply): stale slots can hold NaN/Inf from earlier runs; NaN*0 leaks.
++            init_states = torch.where(mask.bool(), raw_states, torch.zeros_like(raw_states))
+         else:
+             init_states = torch.zeros(padded_batch, dim, state_len, device=x_work.device, dtype=work_dtype)
+ 
+-- 
+2.43.0
+

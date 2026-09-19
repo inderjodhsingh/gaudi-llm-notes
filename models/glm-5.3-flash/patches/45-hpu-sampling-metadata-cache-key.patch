@@ -1,0 +1,46 @@
+From 025e9ae14139824313592140d8d58e5a2d357518 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 11:05:14 +0000
+Subject: [PATCH] HPU input batch: key the selective sampling-metadata cache on
+ request identity and logprob/greedy flags
+
+The fast path returned cached SamplingMetadata whenever the selected slot indices matched, so a new request
+in a reused slot inherited max_num_logprobs (None: no logprobs, API IndexError / HTTP 500) and all_greedy
+(temperature > 0 requests sampled greedily).
+
+---
+ vllm_gaudi/v1/worker/hpu_input_batch.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_input_batch.py b/vllm_gaudi/v1/worker/hpu_input_batch.py
+index e99d47d..3c607cf 100644
+--- a/vllm_gaudi/v1/worker/hpu_input_batch.py
++++ b/vllm_gaudi/v1/worker/hpu_input_batch.py
+@@ -673,8 +673,14 @@ class InputBatch:
+         # costs a blocking H2D copy each (~0.7 ms × 6 on HPU). Hit this even after a
+         # skip_copy=False H2D refresh: the cached SamplingMetadata holds views of the
+         # same storage.
++        # The cached metadata also freezes per-batch scalars (max_num_logprobs, all_greedy, all_random,
++        # generators, logits processors). Keying on slot indices alone let a new request that reuses a slot
++        # inherit the previous occupant's metadata: logprobs silently dropped (API IndexError / HTTP 500) and
++        # temperature>0 requests sampled greedily. Key on request identity and those scalars as well.
++        cache_key = (tuple(req_indices), tuple(rid for rid, _ in req_id_output_token_ids), self.max_num_logprobs,
++                     self.all_greedy, self.all_random)
+         cache = getattr(self, "_selective_md_cache", None)
+-        if cache is not None and cache[0] == tuple(req_indices) and self.no_penalties \
++        if cache is not None and cache[0] == cache_key and self.no_penalties \
+                 and self.no_allowed_token_ids:
+             import dataclasses
+             return dataclasses.replace(cache[1], output_token_ids=[toks for _, toks in req_id_output_token_ids])
+@@ -719,7 +725,7 @@ class InputBatch:
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
+         )
+-        self._selective_md_cache = (tuple(req_indices), md)
++        self._selective_md_cache = (cache_key, md)
+         return md
+ 
+     def set_async_sampled_token_ids(
+-- 
+2.43.0
+

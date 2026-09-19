@@ -1,0 +1,100 @@
+From 0efe31eb059a2c478425cd346fb01b88436a7128 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 14:39:50 +0000
+Subject: [PATCH] HPU KDA: zero pad tokens in bucketed prefill (no-op
+ recurrent)
+
+128-token prompt buckets were walking KDA decay on pad steps, so
+decode state was garbage. Mask qkv/g/beta; enable flatten_input.
+---
+ vllm_gaudi/extension/features.py  |  3 ++-
+ vllm_gaudi/models/glm5next_kda.py | 24 +++++++++++++++++++-----
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/vllm_gaudi/extension/features.py b/vllm_gaudi/extension/features.py
+index 7020514..7a0f936 100644
+--- a/vllm_gaudi/extension/features.py
++++ b/vllm_gaudi/extension/features.py
+@@ -112,7 +112,8 @@ def get_features():
+         Value(
+             'flatten_input',
+             Any(ModelType('qwen3_moe'), ModelType('qwen3_5'), ModelType('qwen3_5_text'), ModelType('granitemoe'),
+-                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'))),
++                ModelType('glm4_moe'), ModelType('glm5_next'), ModelType('glm5_next_text'), ModelType('gemma4'),
++                ModelType('nemotron_h'))),
+         Value('high_level_profiler_enabled', False, env_var='VLLM_PROFILER_ENABLED', env_var_type=boolean),
+         Value('track_graph_compilation', False, env_var='PT_HPU_METRICS_GC_DETAILS', env_var_type=boolean),
+         Value('per_token_kv_scaling_support',
+diff --git a/vllm_gaudi/models/glm5next_kda.py b/vllm_gaudi/models/glm5next_kda.py
+index 1bbb008..845e85e 100644
+--- a/vllm_gaudi/models/glm5next_kda.py
++++ b/vllm_gaudi/models/glm5next_kda.py
+@@ -74,7 +74,7 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+             else:
+                 attn_metadata = raw
+         if attn_metadata is None:
+-            return (False, None, None, None, None, None, 0, 0, 0, None)
++            return (False, None, None, None, None, None, None, 0, 0, 0, None)
+ 
+         is_prompt = bool(getattr(attn_metadata, "is_prompt", False)
+                          or getattr(attn_metadata, "num_prefills", 0) > 0)
+@@ -88,6 +88,7 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
+         if has_initial_state is None:
+             has_initial_state = getattr(attn_metadata, "has_initial_state", None)
++        padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
+ 
+         if not is_prompt:
+             num_decodes = (state_indices.numel() if state_indices is not None else num_tokens)
+@@ -104,8 +105,8 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+                 mask = has_initial_state.bool().view(-1, 1, 1, 1)
+                 initial_state = torch.where(mask, initial_state, torch.zeros_like(initial_state))
+         return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc,
+-                has_initial_state, num_decodes, prefill_num_seqs, prefill_seq_len,
+-                initial_state)
++                has_initial_state, padding_mask_flat, num_decodes, prefill_num_seqs,
++                prefill_seq_len, initial_state)
+ 
+     def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+         orig_shape = hidden_states.shape
+@@ -113,8 +114,8 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         num_tokens = hidden_states.size(0)
+ 
+         (is_prompt, conv_state, ssm_state, state_indices, query_start_loc,
+-         has_initial_state, num_decodes, prefill_num_seqs, prefill_seq_len,
+-         initial_state) = self._extract_metadata(num_tokens)
++         has_initial_state, padding_mask_flat, num_decodes, prefill_num_seqs,
++         prefill_seq_len, initial_state) = self._extract_metadata(num_tokens)
+ 
+         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+         qkv, beta_raw, f_a, g_a = projected.split(
+@@ -134,6 +135,16 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+         )
+         beta = torch.sigmoid(beta_raw.float()).to(hidden_states.dtype)
+ 
++        # Bucket padding: pad steps must be KDA no-ops (q=k=v=0, g=0 => exp(g)=1,
++        # beta=0). Otherwise recurrent decay walks 128-token buckets and
++        # pollutes the saved state used by decode.
++        if (is_prompt and padding_mask_flat is not None
++                and padding_mask_flat.numel() == num_tokens):
++            token_mask = padding_mask_flat.view(-1, 1).to(dtype=qkv.dtype)
++            qkv = qkv * token_mask
++            g = g * token_mask.view(-1, 1, 1)
++            beta = beta * token_mask.view(-1, 1)
++
+         if self._merged_conv_weight is None:
+             def _w(m):
+                 return m.weight.view(m.weight.size(0), m.weight.size(2))
+@@ -160,6 +171,9 @@ class HPUGlm5NextLinearAttention(Glm5NextLinearAttention):
+                 activation="silu",
+                 is_prompt=True,
+             ).transpose(0, 1)
++            if (padding_mask_flat is not None
++                    and padding_mask_flat.numel() == mixed.size(0)):
++                mixed = mixed * padding_mask_flat.view(-1, 1).to(dtype=mixed.dtype)
+             q, k, v = mixed.split(self.local_projection_size, dim=-1)
+             q = q.reshape(1, -1, self.local_num_heads, self.head_dim)
+             k = k.reshape(1, -1, self.local_num_heads, self.head_dim)
+-- 
+2.43.0
+

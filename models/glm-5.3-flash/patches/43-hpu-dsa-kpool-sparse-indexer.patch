@@ -1,0 +1,551 @@
+From f9575290b7d731d725c18821c61e945058b63bd9 Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 18:30:52 +0000
+Subject: [PATCH] HPU DSA: torch-native k-pool sparse indexer behind
+ VLLM_HPU_DSA_SPARSE (bias on dense MLA kernels)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ vllm_gaudi/attention/backends/hpu_attn.py |  16 +-
+ vllm_gaudi/attention/oot_mla.py           |  93 +++++++-
+ vllm_gaudi/extension/features.py          |   1 +
+ vllm_gaudi/ops/hpu_dsa_indexer.py         | 277 ++++++++++++----------
+ vllm_gaudi/v1/worker/hpu_model_runner.py  |  13 +
+ 5 files changed, 271 insertions(+), 129 deletions(-)
+
+diff --git a/vllm_gaudi/attention/backends/hpu_attn.py b/vllm_gaudi/attention/backends/hpu_attn.py
+index 5046923..c723b82 100644
+--- a/vllm_gaudi/attention/backends/hpu_attn.py
++++ b/vllm_gaudi/attention/backends/hpu_attn.py
+@@ -262,7 +262,9 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+ 
+     def forward_mha(  # type: ignore
+             self, q: torch.Tensor, latent_vec_k: torch.Tensor, k_cache: torch.Tensor,
+-            attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
++            attn_metadata: HPUAttentionMetadata, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
++        # attn_bias: explicit [B, 1, L, L] additive bias (DSA sparse selection, already causal
++        # and length-masked); when given it replaces the metadata bias / causal flag.
+ 
+         ##### get prefix cache #####
+         if attn_metadata.block_list is not None:
+@@ -316,10 +318,10 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+                                       query=q,
+                                       key=k,
+                                       value=v_padded,
+-                                      is_causal=True,
+-                                      attn_bias=attn_metadata.attn_bias,
++                                      is_causal=attn_bias is None,
++                                      attn_bias=attn_metadata.attn_bias if attn_bias is None else attn_bias,
+                                       position_bias=None,
+-                                      valid_seq_lengths=attn_metadata.seq_lens_tensor,
++                                      valid_seq_lengths=attn_metadata.seq_lens_tensor if attn_bias is None else None,
+                                       scale=self.scale,
+                                       matmul_qk_op=self.matmul_qk,
+                                       softmax_op=self.softmax,
+@@ -334,7 +336,9 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+ 
+     def forward_mqa(  # type: ignore
+             self, q_nope: torch.Tensor, q_pe: torch.Tensor, k_cache: torch.Tensor,
+-            attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
++            attn_metadata: HPUAttentionMetadata, block_bias: torch.Tensor | None = None) -> torch.Tensor:
++        # block_bias: explicit [num_blocks, block_size] additive bias (DSA sparse selection on top of
++        # the block-usage bias); when given it replaces attn_metadata.attn_bias.
+         if k_cache is not None and isinstance(k_cache, tuple):
+             key_cache, value_cache, k_scales, v_scales = \
+                 HPUPagedAttention.split_kv_cache(k_cache, self.num_kv_heads, self.head_size)
+@@ -351,7 +355,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+                                                   value_cache=value_cache,
+                                                   block_list=attn_metadata.block_list,
+                                                   block_mapping=attn_metadata.block_mapping,
+-                                                  block_bias=attn_metadata.attn_bias,
++                                                  block_bias=attn_metadata.attn_bias if block_bias is None else block_bias,
+                                                   block_groups=attn_metadata.block_groups,
+                                                   block_size=attn_metadata.block_size,
+                                                   scale=self.scale,
+diff --git a/vllm_gaudi/attention/oot_mla.py b/vllm_gaudi/attention/oot_mla.py
+index ab7ea3e..b1f9049 100644
+--- a/vllm_gaudi/attention/oot_mla.py
++++ b/vllm_gaudi/attention/oot_mla.py
+@@ -15,6 +15,8 @@ from vllm_gaudi.extension.utils import (FP8Matmul, Matmul, B2BMatmul, ModuleFuse
+ from vllm_gaudi.attention.backends.hpu_attn import HPUMLAMetadata
+ import vllm_gaudi.extension.kernels as kernels
+ from vllm.forward_context import ForwardContext, get_forward_context
++from vllm_gaudi.extension.runtime import get_config
++from vllm_gaudi.ops.hpu_dsa_indexer import (HPUKpoolIndexer, decode_sparse_block_bias, prefill_sparse_bias)
+ 
+ 
+ class _DummyPrefillBackend:
+@@ -54,6 +56,11 @@ class HPUMLAAttention(MLAAttention):
+         HPUFusedSDPA = kernels.fsdpa()
+         self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
+             else ModuleFusedSDPA(HPUFusedSDPA)
++        # Phase 3b (VLLM_HPU_DSA_SPARSE): k-pool DSA indexer module (set by the wrapper), its
++        # per-slot [k | gate] cache (allocated by the runner after the KV cache) and the cache op.
++        self.kpool_indexer: HPUKpoolIndexer | None = None
++        self.indexer_cache: torch.Tensor | None = None
++        self.indexer_kv = VLLMKVCache()
+ 
+     def bind_kv_cache(self, kv_cache) -> None:
+         """Store the HPU per-layer KV-cache tuple unchanged.
+@@ -77,7 +84,10 @@ class HPUMLAAttention(MLAAttention):
+         k_pe: torch.Tensor,
+         output_shape: torch.Size | None = None,
+         q_dcp_replicated: torch.Tensor | None = None,
++        sparse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     ) -> torch.Tensor:
++        # `sparse` = (indexer q [T,Hi,Di], [k | gate] rows [T,2Di], head weights [T,Hi]) from the
++        # k-pool indexer (Phase 3b); None = dense MLA.
+         # `q_dcp_replicated` was added to the base MLAAttention.forward signature
+         # by vllm#45964 (DCP query replication for MLA decode). Decode-context
+         # parallelism is not enabled on HPU, so the inherited wrapper forward
+@@ -109,8 +119,9 @@ class HPUMLAAttention(MLAAttention):
+             #    self.kv_cache_dtype,
+             #    self._k_scale,
+             #)
+-            return self.forward_impl(q, kv_c_normed, k_pe, self_kv_cache, attn_metadata)
++            return self.forward_impl(q, kv_c_normed, k_pe, self_kv_cache, attn_metadata, sparse=sparse)
+         else:
++            assert sparse is None, "DSA sparse MLA needs the direct-call attention path on HPU"
+             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                 kv_c_normed,
+                 k_pe,
+@@ -139,6 +150,7 @@ class HPUMLAAttention(MLAAttention):
+         output: torch.Tensor | None = None,
+         output_scale: torch.Tensor | None = None,
+         output_block_scale: torch.Tensor | None = None,
++        sparse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     ) -> torch.Tensor:
+         is_prefill = attn_metadata.is_prompt
+ 
+@@ -176,8 +188,12 @@ class HPUMLAAttention(MLAAttention):
+                 latent_vec_k = latent_vec_k.reshape(latent_vec_k.shape[0], *k_cache.shape[1:])
+             self.impl.latent_cache_k(latent_vec_k, k_cache, slot_mapping)
+ 
++        prompt_bias = block_bias = None
++        if sparse is not None:
++            prompt_bias, block_bias = self._dsa_sparse_bias(q, sparse, slot_mapping, attn_metadata, is_prefill)
++
+         if is_prefill:
+-            output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
++            output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata, attn_bias=prompt_bias)
+             # Fully masked pad query rows (bucket padding) can come out of the fused
+             # attention as NaN; zero them so they cannot leak downstream.
+             seq_lens = getattr(attn_metadata, "seq_lens_tensor", None)
+@@ -191,9 +207,34 @@ class HPUMLAAttention(MLAAttention):
+                     output = torch.where(valid, output, torch.zeros_like(output))
+             return output
+         else:
+-            output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
++            output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata, block_bias=block_bias)
+             output = self._v_up_proj(output)
+             return output
++
++    def _dsa_sparse_bias(self, q, sparse, slot_mapping, attn_metadata, is_prefill):
++        """Write the current tokens' indexer rows and build the sparse attention bias.
++
++        Prefill (no chunking / prefix context): [B, 1, L, L] bias for the fused SDPA.
++        Decode: [num_blocks, block_size] bias on top of the runner's block-usage bias.
++        """
++        ind = self.kpool_indexer
++        assert ind is not None and self.indexer_cache is not None, "DSA sparse: indexer cache not allocated"
++        qi, kg, wi = sparse
++        self.indexer_kv(kg, self.indexer_cache, slot_mapping)
++        ape, scale, topk, kpool = ind.index_kpool_compress_ape, ind.softmax_scale, ind.topk_tokens, ind.kpool
++        if is_prefill:
++            assert attn_metadata.block_list is None, "DSA sparse prefill needs whole prompts (chunked prefill off)"
++            bsz = int(attn_metadata.seq_lens_tensor.shape[0])
++            length = q.shape[0] // bsz
++            bias = prefill_sparse_bias(qi.view(bsz, length, ind.n_heads, ind.head_dim), kg.view(bsz, length, -1),
++                                       wi.view(bsz, length, ind.n_heads), ape, scale, topk, kpool,
++                                       chunk=1024, out_dtype=q.dtype)
++            return bias, None
++        blocks = self.indexer_kv.fetch_from_cache(self.indexer_cache.unflatten(0, (-1, attn_metadata.block_size)),
++                                                  attn_metadata.block_list)
++        bias = decode_sparse_block_bias(qi, wi, blocks, ape, scale, attn_metadata.block_groups,
++                                        attn_metadata.seq_lens_tensor, attn_metadata.attn_bias, topk, kpool)
++        return None, bias
+             # NOTE(Xinyu): Make the loaded weight contiguous to avoid the transpose
+ 
+     # during each graph execution
+@@ -375,6 +416,50 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
+             kv_b_proj=self.kv_b_proj,
+             # Dense-MLA fallback: never request a sparse backend on HPU.
+             use_sparse=False,
+-            indexer=self.indexer,
++            indexer=None if isinstance(self.indexer, HPUKpoolIndexer) else self.indexer,
+             non_causal_multi_token_decode=non_causal_multi_token_decode,
+         )
++        # Phase 3b: torch-native k-pool DSA indexer (VLLM_HPU_DSA_SPARSE); see hpu_dsa_indexer.py.
++        self.mla_attn.kpool_indexer = self.indexer if isinstance(self.indexer, HPUKpoolIndexer) else None
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        llama_4_scaling: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        # Same as MultiHeadLatentAttentionWrapper.forward (no DCP on HPU) plus the k-pool indexer,
++        # whose outputs ride along to HPUMLAAttention as the sparse selection inputs.
++        q_c = None
++        if self.q_lora_rank is not None:
++            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
++            q_c, kv_lora = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1)
++            q_c = self.q_a_layernorm(q_c)
++            q = self.q_b_proj(q_c)[0]
++        else:
++            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
++            q = self.q_proj(hidden_states)[0]
++        if self.qk_rope_head_dim == 0:
++            kv_c = kv_lora
++            k_pe = kv_lora.new_zeros(*kv_lora.shape[:-1], 0)
++        else:
++            kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
++        kv_c_normed = self.kv_a_layernorm(kv_c)
++        k_pe = k_pe.unsqueeze(1)
++        q = q.view(-1, self.num_heads, self.qk_head_dim)
++        if self.rotary_emb is not None:
++            q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(positions, q[..., self.qk_nope_head_dim:], k_pe)
++        sparse = None
++        if self.mla_attn.kpool_indexer is not None:
++            assert q_c is not None, "k-pool indexer projects from the q-lora residual"
++            sparse = self.mla_attn.kpool_indexer(hidden_states, q_c)
++        if llama_4_scaling is not None:
++            q *= llama_4_scaling
++        attn_out = self.mla_attn(q,
++                                 kv_c_normed,
++                                 k_pe,
++                                 output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
++                                 sparse=sparse)
++        if self.g_proj is not None:
++            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
++        return self.o_proj(attn_out)[0]
+diff --git a/vllm_gaudi/extension/features.py b/vllm_gaudi/extension/features.py
+index 8f3926d..21ab897 100644
+--- a/vllm_gaudi/extension/features.py
++++ b/vllm_gaudi/extension/features.py
+@@ -107,6 +107,7 @@ def get_features():
+         Value('defrag', Enabled('use_contiguous_pa')),
+         Value('regional_compilation', True, env_var='VLLM_T_COMPILE_REGIONAL_COMPILATION', env_var_type=boolean),
+         Value('mla_skip_v_cache', False, env_var='VLLM_HPU_MLA_SKIP_V_CACHE', env_var_type=boolean),
++        Value('dsa_sparse', False, env_var='VLLM_HPU_DSA_SPARSE', env_var_type=boolean),
+         Value('dynamic_shapes_compilation', True, env_var='VLLM_T_COMPILE_DYNAMIC_SHAPES', env_var_type=boolean),
+         Value('fullgraph_compilation', False, env_var='VLLM_T_COMPILE_FULLGRAPH', env_var_type=boolean),
+         Value('scale_adjustment', True, env_var='VLLM_SCALE_ADJUSTMENT', env_var_type=boolean),
+diff --git a/vllm_gaudi/ops/hpu_dsa_indexer.py b/vllm_gaudi/ops/hpu_dsa_indexer.py
+index bd6f496..f70e00e 100644
+--- a/vllm_gaudi/ops/hpu_dsa_indexer.py
++++ b/vllm_gaudi/ops/hpu_dsa_indexer.py
+@@ -1,128 +1,167 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Torch-native DSA indexer for GLM-5.3-Flash on HPU (Phase 3b).
+-
+-No DeepGEMM / FWHT-FP8 / kpool CUDA. BF16 MQA logits, F32 weight projection,
+-static ``torch.topk``, ``index_select`` gather. Causal: scores for s>t are -inf.
+-
+-When prefix length <= index_topk (2048), selecting the full prefix is exact
+-vs dense MLA.
++"""Torch-native k-pool DSA indexer for GLM-5.3-Flash on HPU (Phase 3b).
++
++Semantics follow the HF reference (``Glm5NextTextIndexer``), verified token-for-token
++by ``scripts/test_dsa_select.py``:
++
++* indexer q = wq_b(q_c) [T, H, D]; k = layer_norm(wk(x)) [T, D]; gate = x @ gate_w.T [T, D];
++  w = weights_proj(x) [T, H].
++* keys are pooled ``kpool`` (=4) consecutive tokens at a time, starting at position 0:
++  pool_key = sum(softmax(gate + ape) * k).
++* index score(t, p) = sum_h w[t,h] * H^-0.5 * relu(scale * q[t,h] . pool_key[p]).
++* a pool is selectable by query t iff it is complete and its last token <= t.
++* the top ``topk / kpool`` (=512) pools are selected (2048 tokens) plus the incomplete tail
++  pool [kpool * floor((t+1)/kpool), t] (0..3 tokens, always includes t itself).
++* for t + 1 <= topk + kpool - 1 (2051) every visible token is selected, so dense MLA is exact.
++
++Everything is static-shape: bucketed prompt length L (multiple of kpool), padded decode block
++lists. Sparsity is applied as an additive -inf bias on the existing dense HPU attention
++kernels (prefill: [B, 1, L, L] bias for the fused SDPA; decode: per-block [N, block_size]
++bias for flat paged attention), so the numerics of the attention itself are unchanged.
+ """
+ from __future__ import annotations
+ 
++import math
++
+ import torch
++import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-
+-def indexer_k_norm(k: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+-    d = k.shape[-1]
+-    return F.layer_norm(k.float(), (d,), weight.float(), bias.float(), eps).type_as(k)
+-
+-
+-def indexer_mqa_logits(
+-    q: torch.Tensor,
+-    k: torch.Tensor,
+-    weights: torch.Tensor,
+-    scale: float,
+-) -> torch.Tensor:
+-    """ReLU-weighted MQA logits.
+-
+-    q: [Tq, H, D], k: [Tk, D] (shared across heads), weights: [Tq, H]
+-    returns scores [Tq, Tk] float32
+-    """
+-    qf = q.float()
+-    kf = k.float()
+-    # [Tq, H, Tk]
+-    logits = torch.matmul(qf, kf.transpose(0, 1).contiguous()) * float(scale)
+-    w = F.relu(weights.float()).unsqueeze(-1)
+-    return (w * logits).sum(dim=1)
+-
+-
+-def causal_prefix_mask(scores: torch.Tensor) -> torch.Tensor:
+-    """scores [Tq, Tk]; assume Tq==Tk for prefill aligned sequences."""
+-    tq, tk = scores.shape
+-    t = min(tq, tk)
+-    mask = torch.ones(tq, tk, dtype=torch.bool, device=scores.device)
+-    mask[:t, :t] = torch.triu(mask[:t, :t], diagonal=1)
+-    if tq > t:
+-        mask[t:, :] = True
+-    if tk > t:
+-        mask[:, t:] = True
+-    return scores.masked_fill(mask, float("-inf"))
+-
+-
+-def indexer_topk(
+-    scores: torch.Tensor,
+-    topk: int,
+-    pad_to: int | None = None,
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Static-k topk. Pad prefix scores with -inf if pad_to > Tk.
+-
+-    returns (values [Tq, K], indices [Tq, K])
++_NEG = float("-inf")
++
++
++class HPUKpoolIndexer(nn.Module):
++    """Parameters and projections of the k-pool indexer (names match the checkpoint)."""
++
++    def __init__(self, hidden_size: int, q_lora_rank: int, n_heads: int, head_dim: int, kpool: int, topk: int,
++                 dtype: torch.dtype = torch.bfloat16):
++        super().__init__()
++        self.n_heads, self.head_dim, self.kpool, self.topk_tokens = n_heads, head_dim, kpool, topk
++        self.wq_b = nn.Linear(q_lora_rank, n_heads * head_dim, bias=False, dtype=dtype)
++        self.wk = nn.Linear(hidden_size, head_dim, bias=False, dtype=dtype)
++        self.k_norm = nn.LayerNorm(head_dim, eps=1e-6, dtype=dtype)
++        self.weights_proj = nn.Linear(hidden_size, n_heads, bias=False, dtype=dtype)
++        self.index_kpool_compress_gate = nn.Parameter(torch.zeros(head_dim, hidden_size, dtype=dtype))
++        self.index_kpool_compress_ape = nn.Parameter(torch.zeros(kpool, head_dim, dtype=torch.float32))
++        self.softmax_scale = head_dim**-0.5
++
++    def forward(self, hidden_states: torch.Tensor, q_c: torch.Tensor):
++        """hidden_states [T, hidden], q_c [T, q_lora_rank] (after q_a_layernorm).
++
++        Returns q [T, H, D], kg [T, 2D] (k | gate, the per-token indexer cache row), w [T, H]."""
++        q = self.wq_b(q_c).view(-1, self.n_heads, self.head_dim)
++        k = F.layer_norm(self.wk(hidden_states).float(), (self.head_dim, ), self.k_norm.weight.float(),
++                         self.k_norm.bias.float(), self.k_norm.eps).to(hidden_states.dtype)
++        gate = F.linear(hidden_states, self.index_kpool_compress_gate)
++        w = self.weights_proj(hidden_states)
++        return q, torch.cat([k, gate], dim=-1), w
++
++
++def pool_keys(kg: torch.Tensor, ape: torch.Tensor, kpool: int) -> torch.Tensor:
++    """kg [..., L, 2D] with L a multiple of kpool -> pooled keys [..., L/kpool, D]."""
++    d = kg.shape[-1] // 2
++    k, gate = kg.split(d, dim=-1)
++    lead = k.shape[:-2]
++    p = k.shape[-2] // kpool
++    k4 = k.reshape(*lead, p, kpool, d)
++    g4 = gate.reshape(*lead, p, kpool, d)
++    prob = (g4.float() + ape.float()).softmax(dim=-2).to(k.dtype)
++    return (prob * k4).sum(dim=-2)
++
++
++def index_scores(q: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, scale: float) -> torch.Tensor:
++    """q [..., C, H, D], pk [..., P, D], w [..., C, H] -> [..., C, P] float32 (ReLU-weighted MQA logits)."""
++    h = q.shape[-2]
++    s = torch.matmul(q.float(), pk.float().transpose(-1, -2).unsqueeze(-3))  # [..., C, H, P]
++    s = F.relu(s * scale)
++    wf = (w.float() * (h**-0.5)).unsqueeze(-1)  # [..., C, H, 1]
++    return (wf * s).sum(dim=-2)
++
++
++def prefill_sparse_bias(q: torch.Tensor, kg: torch.Tensor, w: torch.Tensor, ape: torch.Tensor, scale: float,
++                        topk: int, kpool: int, chunk: int = 1024, out_dtype: torch.dtype | None = None) -> torch.Tensor:
++    """Additive attention bias [B, 1, L, L] for bucketed prompts (token t of each sequence at position t).
++
++    q [B, L, H, D], kg [B, L, 2D], w [B, L, H]. Rows of pad queries keep their own token allowed so no
++    row is fully masked (their output is discarded by the caller). Pad keys are never selected by real rows.
+     """
+-    tq, tk = scores.shape
+-    k = min(int(topk), tk if pad_to is None else max(tk, pad_to))
+-    if pad_to is not None and pad_to > tk:
+-        pad = scores.new_full((tq, pad_to - tk), float("-inf"))
+-        scores = torch.cat([scores, pad], dim=-1)
+-        tk = pad_to
+-        k = min(int(topk), tk)
+-    return torch.topk(scores, k=k, dim=-1, sorted=True)
+-
+-
+-def gather_kv(k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Gather MLA K/V. k,v: [T, H, D], indices: [Tq, K] -> [Tq, K, H, D]."""
+-    t, h, d = k.shape
+-    tq, kk = indices.shape
+-    idx = indices.clamp(0, t - 1)
+-    flat = idx.reshape(-1)
+-    kg = k.index_select(0, flat).view(tq, kk, h, d)
+-    vg = v.index_select(0, flat).view(tq, kk, h, d)
+-    return kg, vg
+-
+-
+-def sparse_attend(
+-    q: torch.Tensor,
+-    k_g: torch.Tensor,
+-    v_g: torch.Tensor,
+-    scale: float,
+-    idx: torch.Tensor,
+-    query_pos: torch.Tensor | None = None,
+-) -> torch.Tensor:
+-    """Attend q [Tq,H,D] to gathered k/v [Tq,K,H,D]. Causal on original positions."""
+-    tq, h, d = q.shape
+-    scores = torch.einsum("thd,tkhd->thk", q.float(), k_g.float()) * float(scale)
+-    if query_pos is None:
+-        query_pos = torch.arange(tq, device=q.device)
+-    # mask gathered keys that are strictly after the query token
+-    invalid = idx > query_pos.unsqueeze(-1)
+-    scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
+-    attn = torch.softmax(scores, dim=-1)
+-    out = torch.einsum("thk,tkhd->thd", attn, v_g.float())
+-    return out.to(q.dtype)
+-
+-
+-def kpool_last_wins(k: torch.Tensor, kpool: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Pool-granular K: last token of each complete pool (ROCm last-wins).
+-
+-    k: [T, D] -> pooled [n_pool, D] and pool-end positions [n_pool]
++    b, l = kg.shape[:2]
++    assert l % kpool == 0, (l, kpool)
++    p_all = l // kpool
++    dev = q.device
++    pk = pool_keys(kg, ape, kpool)  # [B, P, D]
++    pool_end = torch.arange(p_all, device=dev) * kpool + (kpool - 1)  # [P]
++    select_k = min(topk // kpool, p_all)
++    allowed = torch.zeros(b, l, l, dtype=torch.bool, device=dev)
++    fmin = torch.finfo(torch.float32).min
++    for c0 in range(0, l, chunk):
++        c1 = min(c0 + chunk, l)
++        s = index_scores(q[:, c0:c1], pk, w[:, c0:c1], scale)  # [B, C, P]
++        qpos = torch.arange(c0, c1, device=dev)
++        valid = (pool_end.unsqueeze(0) <= qpos.unsqueeze(1)).unsqueeze(0).expand(b, -1, -1)  # [B, C, P]
++        s = s.masked_fill(~valid, fmin)
++        sel = s.topk(select_k, dim=-1).indices  # [B, C, K]
++        sel_valid = valid.gather(2, sel)
++        ap = torch.zeros(b, c1 - c0, p_all, dtype=torch.bool, device=dev).scatter_(2, sel, sel_valid)
++        allowed[:, c0:c1] = ap.repeat_interleave(kpool, dim=2)
++    j = torch.arange(l, device=dev)
++    qpos = torch.arange(l, device=dev)
++    tail_start = (qpos + 1) // kpool * kpool
++    tail = (j.view(1, -1) >= tail_start.view(-1, 1)) & (j.view(1, -1) <= qpos.view(-1, 1))  # [L, L]
++    allowed |= tail.unsqueeze(0)
++    dt = out_dtype or q.dtype
++    return torch.zeros(b, 1, l, l, dtype=dt, device=dev).masked_fill_(~allowed.unsqueeze(1), _NEG)
++
++
++def decode_sparse_block_bias(q: torch.Tensor, w: torch.Tensor, kg_blocks: torch.Tensor, ape: torch.Tensor,
++                             scale: float, block_groups: torch.Tensor, seq_lens: torch.Tensor,
++                             base_bias: torch.Tensor, topk: int, kpool: int) -> torch.Tensor:
++    """Per-block additive bias [N, block_size] for flat paged decode attention.
++
++    q [Bp, H, D] / w [Bp, H]: the single decode token of each (padded) sequence; kg_blocks [N, block_size, 2D]:
++    indexer cache rows of the padded block list (block i belongs to sequence block_groups[i], -1 for pad
++    blocks; blocks of a sequence appear consecutively in position order); seq_lens [Bp]: sequence length
++    including the current token; base_bias [N, block_size]: the runner's block-usage bias (0 / -inf).
+     """
+-    t = k.shape[0]
+-    n = t // kpool
+-    if n == 0:
+-        return k[:0], k.new_zeros((0,), dtype=torch.long)
+-    ends = torch.arange(kpool - 1, n * kpool, kpool, device=k.device)
+-    return k.index_select(0, ends), ends
+-
+-
+-def kpool_softmax(k: torch.Tensor, gate: torch.Tensor, ape: torch.Tensor, kpool: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Softmax-weighted pool of kpool tokens. gate/k: [T, D], ape: [kpool, D]."""
+-    t, d = k.shape
+-    n = t // kpool
+-    if n == 0:
+-        return k[:0], k.new_zeros((0,), dtype=torch.long)
+-    k4 = k[: n * kpool].view(n, kpool, d)
+-    g4 = gate[: n * kpool].view(n, kpool, d)
+-    w = torch.softmax(g4.float() + ape.float().unsqueeze(0), dim=1)
+-    pooled = (w * k4.float()).sum(dim=1).to(k.dtype)
+-    ends = torch.arange(kpool - 1, n * kpool, kpool, device=k.device)
+-    return pooled, ends
++    n, bs = kg_blocks.shape[:2]
++    bp = q.shape[0]
++    dev = q.device
++    assert bs % kpool == 0
++    pb = bs // kpool
++    pk = pool_keys(kg_blocks, ape, kpool)  # [N, Pb, D]
++    grp = block_groups.clamp(min=0)
++    s = index_scores(q[grp].unsqueeze(1), pk, w[grp].unsqueeze(1), scale).squeeze(1)  # [N, Pb]
++    # index of each block within its own sequence (blocks are consecutive per sequence)
++    onehot = F.one_hot(torch.where(block_groups < 0, torch.full_like(block_groups, bp), block_groups),
++                       num_classes=bp + 1).to(torch.float32)  # [N, Bp+1]
++    kidx = ((onehot.cumsum(0) * onehot).sum(1) - 1).to(torch.long)  # [N]
++    qpos = (seq_lens.to(torch.long) - 1)[grp]  # [N] position of the current token of the owning sequence
++    pool_end = kidx.unsqueeze(1) * bs + torch.arange(pb, device=dev) * kpool + (kpool - 1)  # [N, Pb]
++    valid = (pool_end <= qpos.unsqueeze(1)) & (block_groups >= 0).unsqueeze(1)
++    fmin = torch.finfo(torch.float32).min
++    s = s.masked_fill(~valid, fmin).reshape(-1)  # [N*Pb]
++    valid = valid.reshape(-1)
++    grp_flat = grp.repeat_interleave(pb)  # [N*Pb]
++    own = grp_flat.unsqueeze(0) == torch.arange(bp, device=dev).unsqueeze(1)  # [Bp, N*Pb]
++    s_all = torch.where(own, s.unsqueeze(0), torch.full_like(s, fmin).unsqueeze(0))
++    v_all = own & valid.unsqueeze(0)
++    select_k = min(topk // kpool, n * pb)
++    sel = s_all.topk(select_k, dim=-1).indices  # [Bp, K]
++    sel_valid = v_all.gather(1, sel)
++    allowed = torch.zeros(bp, n * pb, dtype=torch.bool, device=dev).scatter_(1, sel, sel_valid).any(0)  # [N*Pb]
++    allowed = allowed.view(n, pb).repeat_interleave(kpool, dim=1)  # [N, block_size]
++    pos = kidx.unsqueeze(1) * bs + torch.arange(bs, device=dev).unsqueeze(0)  # [N, block_size]
++    tail = (pos >= ((qpos + 1) // kpool * kpool).unsqueeze(1)) & (pos <= qpos.unsqueeze(1))
++    allowed |= tail
++    return base_bias.masked_fill(~allowed, _NEG)
++
++
++def dense_exact_len(topk: int, kpool: int) -> int:
++    """Longest sequence for which the sparse selection covers every visible token."""
++    return topk + kpool - 1
++
++
++__all__ = [
++    "HPUKpoolIndexer", "pool_keys", "index_scores", "prefill_sparse_bias", "decode_sparse_block_bias",
++    "dense_exact_len"
++]
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index 91c5f1d..6c63ce0 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -7194,6 +7194,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 kv_caches[layer_name] = kv_caches[target_layer_name]
+         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
+         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
++        if get_config().dsa_sparse:
++            # Phase 3b: per-slot [k | gate] indexer cache next to each sparse MLA layer's latent cache.
++            from vllm_gaudi.attention.oot_mla import HPUMLAAttention
++            n_alloc = 0
++            for _n, mod in self.model.named_modules():
++                if isinstance(mod, HPUMLAAttention) and mod.kpool_indexer is not None and mod.kv_cache is not None:
++                    kc = mod.kv_cache[0] if isinstance(mod.kv_cache, (tuple, list)) else mod.kv_cache
++                    mod.indexer_cache = torch.zeros((kc.shape[0], 2 * mod.kpool_indexer.head_dim),
++                                                    dtype=self.model_config.dtype,
++                                                    device=self.device)
++                    n_alloc += 1
++            logger.info("DSA sparse: allocated %d indexer caches of %s rows", n_alloc,
++                        kc.shape[0] if n_alloc else 0)
+ 
+         if self.enable_bucketing:
+             self.bucketing_manager.num_hpu_blocks = num_blocks
+-- 
+2.43.0
+

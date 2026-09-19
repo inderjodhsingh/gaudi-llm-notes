@@ -1,0 +1,121 @@
+From 4ac40f6cc9a4c9093a6e4d3c4ca3f692721f1dcf Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 11:05:14 +0000
+Subject: [PATCH] HPU runner: GLM53_NLL_DIR per-position next-token logprob
+ dump and in-serve DSA sparse toggle
+
+While <dir>/ENABLE exists, whole-prompt prefills write the true next-token log-prob of every position
+(1024-row compute_logits chunks) to <dir>/nll_*.pt on rank 0; <dir>/SPARSE_OFF runs the DSA layers dense.
+Used to measure 32k perplexity sparse vs dense in one serve lifetime.
+
+---
+ vllm_gaudi/v1/worker/hpu_model_runner.py | 72 ++++++++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/vllm_gaudi/v1/worker/hpu_model_runner.py b/vllm_gaudi/v1/worker/hpu_model_runner.py
+index ecbddde..51be6f8 100644
+--- a/vllm_gaudi/v1/worker/hpu_model_runner.py
++++ b/vllm_gaudi/v1/worker/hpu_model_runner.py
+@@ -1455,6 +1455,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         self.supports_mm_inputs = False
+ 
+         self.sampler = Sampler()
++        # GLM53_NLL_DIR: per-position next-token log-prob dumps of whole prompts (perplexity measurement).
++        self._nll_dir = os.environ.get("GLM53_NLL_DIR")
+ 
+         # NOTE(kzawora) update_env is a hack to work around VLLMKVCache in
+         # hpu-extension which selects fetch_from_cache implementation based
+@@ -3925,6 +3927,72 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         return non_flattened_hidden_states, aux_hidden_states, \
+             hidden_states, logits
+ 
++    def _nll_mla_modules(self):
++        if getattr(self, "_nll_mla_cache", None) is None:
++            from vllm_gaudi.attention.oot_mla import HPUMLAAttention
++            self._nll_mla_cache = [m for m in self.model.modules() if isinstance(m, HPUMLAAttention)]
++        return self._nll_mla_cache
++
++    def _apply_nll_sparse_toggle(self):
++        """GLM53_NLL_DIR/SPARSE_OFF present -> run the DSA layers dense; absent -> restore the k-pool indexer.
++
++        Lets one serve lifetime measure sparse and dense perplexity (the flip recompiles the affected graphs once).
++        """
++        want_off = os.path.exists(os.path.join(self._nll_dir, "SPARSE_OFF"))
++        n = 0
++        for m in self._nll_mla_modules():
++            if want_off and m.kpool_indexer is not None:
++                m._nll_saved_indexer = m.kpool_indexer
++                m.kpool_indexer = None
++                n += 1
++            elif not want_off and m.kpool_indexer is None and getattr(m, "_nll_saved_indexer", None) is not None:
++                m.kpool_indexer = m._nll_saved_indexer
++                n += 1
++        if n:
++            logger.info("GLM53_NLL: sparse indexer %s on %d MLA layers", "disabled" if want_off else "enabled", n)
++
++    def _dump_prompt_nll(self, req_ids, nf_hs, scheduler_output):
++        """GLM53_NLL_DIR (active while <dir>/ENABLE exists): log-prob of the true next token at every position of
++        a whole-prompt prefill, computed from the prefill hidden states in fixed 1024-row chunks (static
++        compute_logits shapes; a 32k prompt never materialises 32k x vocab logits). Runs on every rank because
++        compute_logits all-gathers the vocab-parallel logits; rank 0 saves {ids, logp, top1, sparse} and logs PPL.
++        """
++        import math
++        import time as _time
++        if not os.path.exists(os.path.join(self._nll_dir, "ENABLE")):
++            return
++        chunk = 1024
++        for i, rid in enumerate(req_ids):
++            req = self.requests.get(rid)
++            if req is None or req.prompt_token_ids is None or req.num_computed_tokens != 0:
++                continue
++            ids = list(req.prompt_token_ids)
++            n = len(ids)
++            if n < 2 or scheduler_output.num_scheduled_tokens.get(rid, 0) < n:
++                continue
++            hs = nf_hs[i]
++            tgt = torch.tensor(ids[1:], dtype=torch.long)
++            logp = torch.empty(n - 1, dtype=torch.float32)
++            top1 = torch.empty(n - 1, dtype=torch.bool)
++            for s0 in range(0, n - 1, chunk):
++                e0 = min(s0 + chunk, n - 1)
++                h = hs[s0:s0 + chunk]
++                if h.shape[0] < chunk:
++                    h = torch.cat([h, h.new_zeros(chunk - h.shape[0], h.shape[-1])], 0)
++                lsm = torch.log_softmax(self.model.compute_logits(h)[:e0 - s0].float(), dim=-1)
++                t = tgt[s0:e0].to(lsm.device)
++                logp[s0:e0] = lsm.gather(1, t.unsqueeze(1)).squeeze(1).cpu()
++                top1[s0:e0] = (lsm.argmax(-1) == t).cpu()
++            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++            if rank != 0:
++                continue
++            sparse = any(getattr(m, "kpool_indexer", None) is not None for m in self._nll_mla_modules())
++            tag = "sparse" if sparse else "dense"
++            path = os.path.join(self._nll_dir, f"nll_{int(_time.time())}_{n}_{tag}.pt")
++            torch.save({"ids": ids, "logp": logp, "top1": top1, "sparse": sparse}, path)
++            logger.info("GLM53_NLL req=%s tokens=%d ppl=%.4f top1=%.4f mode=%s -> %s", rid, n,
++                        math.exp(-float(logp.double().mean())), float(top1.float().mean()), tag, path)
++
+     def _get_prompt_logprobs_dict(
+         self,
+         prefill_hidden_states: dict[str, torch.Tensor],
+@@ -4654,6 +4722,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+         ######################### PREFILLS #########################
+         if num_prefills > 0:
+             htorch.core.mark_step()
++            if self._nll_dir is not None and not warmup_mode:
++                self._apply_nll_sparse_toggle()
+             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
+                       logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+ 
+@@ -4697,6 +4767,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+                 for i, rid in enumerate(req_id):
+                     if rid in self.input_batch.num_prompt_logprobs:
+                         prefill_hidden_states_for_logprobs[rid] = nf_hs[i]
++                if self._nll_dir is not None and not warmup_mode:
++                    self._dump_prompt_nll(req_id, nf_hs, scheduler_output)
+                 if self.use_aux_hidden_state_outputs:
+                     aux_hidden_states_prefills.append(aux_hidden_states)
+                 sample_hidden_states_prefills.append(sample_hidden_states)
+-- 
+2.43.0
+
