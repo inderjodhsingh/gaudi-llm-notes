@@ -63,8 +63,10 @@ movement past **7/12** greedy / **10/12** thinking-on.
 
 ## Out-of-tree (required — the architecture is not supported by vllm-gaudi)
 
-The patch is [`patches/0001-qwen4-exp-hpu-port.patch`](patches/0001-qwen4-exp-hpu-port.patch) against vllm-gaudi
-`2dd55f97`. vLLM `98dff2a8` is stock. Container: [`docker/Dockerfile`](docker/Dockerfile).
+The series is [`patches/0001-qwen4-exp-hpu-port.patch`](patches/0001-qwen4-exp-hpu-port.patch) then
+[`patches/0002-ple-prefill-state-length.patch`](patches/0002-ple-prefill-state-length.patch) against vllm-gaudi
+`2dd55f97`. vLLM `98dff2a8` is stock. Container: [`docker/Dockerfile`](docker/Dockerfile). `0002` is required:
+without it, thinking-off copy of short identifiers fails below the 64-token prompt bucket.
 
 `qwen4_exp` is CUDA/ROCm-only upstream. The port lives in vllm-gaudi (`vllm_gaudi/models/qwen4_exp.py` and
 friends) and registers `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration`:
@@ -78,8 +80,9 @@ friends) and registers `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration
    (`conv_state [9, 10240]` bf16 + last-2-token ids), n-gram hash reproduced **bit-exactly in int32 8-bit limbs**
    (HPU int64 arithmetic truncates to 32 bit), 320 M-row FP8 table stored as **uint8 + a 256-entry LUT built on the
    CPU** (Gaudi2 decodes e4m3 codes 120–127 to inf), TP-row-sharded with mask + all-reduce.
-6. **State writes**: prefill state gather done eagerly (dynamo-disabled); decode writes eager `index_copy_`. Never read
-   and write the same state tensor inside one compiled graph.
+6. **State writes**: prefill state gather done eagerly (dynamo-disabled), using **padding_mask row sums** as the
+   real query length (not the padded bucket); decode writes eager `index_copy_`. Never read and write the same
+   state tensor inside one compiled graph.
 7. **Per-request metadata** (state slots, query lengths) resolved eagerly at model level and passed into the
    compiled regions as inputs.
 8. Runner/platform glue: `SHORT_CONV` in the GDN mamba types, `.ple` as a mamba-like layer with its cache-group index,

@@ -13,7 +13,10 @@ vLLM 0.29 already vendors `vllm/models/qwen4_exp/` (CUDA/ROCm). The HPU port imp
 git clone https://github.com/vllm-project/vllm-gaudi.git && cd vllm-gaudi
 git checkout 2dd55f97eec0bcfcb1f2c52c2d9aee2c4f43f38c
 git am /path/to/0001-qwen4-exp-hpu-port.patch
+git am /path/to/0002-ple-prefill-state-length.patch
 ```
+
+`0002` is required. Without it, thinking-off identifier copy and short-list prompts fail below the 64-token prompt bucket: PLE decode n-grams hash against pad ids. Rebuild the image or `git am` 0002 on a tree that already has 0001.
 
 Or build [`../docker/Dockerfile`](../docker/Dockerfile).
 

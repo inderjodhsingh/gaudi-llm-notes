@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on Gaudi2. Build from models/qwen3.8-flash-next/:
 #   docker build -f docker/Dockerfile -t qwen38-flash-next-gaudi2:YYYYMMDD .
 #
-# Pins: Habana 1.24.1 / PT 2.11, vLLM 98dff2a8, vllm-gaudi 2dd55f97 + patches/0001.
+# Pins: Habana 1.24.1 / PT 2.11, vLLM 98dff2a8, vllm-gaudi 2dd55f97 + patches/0001 then 0002.
 # vLLM itself is stock; only the plugin is patched. No custom TPC / .so.
 FROM vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0@sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8
 
@@ -23,7 +23,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && ln -sf /usr/bin/python3 /usr/bin/python
 
-COPY patches/0001-qwen4-exp-hpu-port.patch /opt/flash-next/
+COPY patches/*.patch /opt/flash-next/patches/
 COPY docker/constraints.txt /opt/flash-next/
 
 RUN mkdir -p /opt/vllm /opt/vllm-gaudi \
@@ -31,8 +31,10 @@ RUN mkdir -p /opt/vllm /opt/vllm-gaudi \
  && git -C /opt/vllm fetch -q --depth 1 origin "$VLLM_COMMIT" && git -C /opt/vllm checkout -q --detach FETCH_HEAD \
  && git -C /opt/vllm-gaudi init -q && git -C /opt/vllm-gaudi remote add origin "$VLLM_GAUDI_REPO" \
  && git -C /opt/vllm-gaudi fetch -q --depth 1 origin "$VLLM_GAUDI_COMMIT" && git -C /opt/vllm-gaudi checkout -q --detach FETCH_HEAD \
- && git -C /opt/vllm-gaudi -c user.name=flash-next-build -c user.email=build@local \
-      am --committer-date-is-author-date -q /opt/flash-next/0001-qwen4-exp-hpu-port.patch
+ && for f in $(ls /opt/flash-next/patches/*.patch | sort); do \
+      git -C /opt/vllm-gaudi -c user.name=flash-next-build -c user.email=build@local \
+        am --committer-date-is-author-date -q "$f"; \
+    done
 
 # setuptools is not pinned during the build: vLLM's build requirements need <81; the final pin restores 84.0.0.
 RUN cd /opt/vllm \

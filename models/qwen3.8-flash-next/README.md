@@ -106,4 +106,5 @@ rollback).
 - Habana / driver **1.24.1** (`vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0@sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8`)
 - vLLM **v0.29.0** (`98dff2a8`, stock), vllm-gaudi **releases/v0.29.0** (`2dd55f97`) + [`patches/0001-qwen4-exp-hpu-port.patch`](patches/0001-qwen4-exp-hpu-port.patch)
 - transformers 5.16.1, torch 2.11.0a0. Host/firmware: see [RECIPE.md](RECIPE.md).
-- QSA indexer and MTP: **not ported**. Arithmetic probe still **7/12** greedy / **10/12** thinking-on; no later improvement.
+- QSA indexer and MTP: **not ported**. Arithmetic probe still **7/12** greedy / **10/12** thinking-on.
+- Short identifier-copy with thinking off used to fail below the 64-token prompt bucket (first decode hashed PLE n-grams against pad ids). Fixed in [`patches/0002-ple-prefill-state-length.patch`](patches/0002-ple-prefill-state-length.patch).

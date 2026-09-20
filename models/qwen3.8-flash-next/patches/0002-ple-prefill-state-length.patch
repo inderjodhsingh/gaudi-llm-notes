@@ -1,0 +1,132 @@
+From 1cbe9bc275db6b00ff37850393dd7299939582ea Mon Sep 17 00:00:00 2001
+From: Gaudi port <gaudi-port@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 02:38:22 +0000
+Subject: [PATCH] PLE prefill state: gather from unpadded prompt length
+
+Use padding_mask_flat row sums as the real query length when writing
+PLE conv/token state after prefill. query_start_loc can track the
+padded bucket, so the first decode step hashed n-grams against pad
+ids and short identifier-copy prompts failed below the 64-token
+bucket/chunk. Clamp gather indices.
+---
+ vllm_gaudi/models/qwen4_exp.py        | 25 ++++++++++++++++++++-----
+ vllm_gaudi/models/qwen4_exp_legacy.py | 25 ++++++++++++++++++++-----
+ 2 files changed, 40 insertions(+), 10 deletions(-)
+
+diff --git a/vllm_gaudi/models/qwen4_exp.py b/vllm_gaudi/models/qwen4_exp.py
+index a790e2d..59ca128 100644
+--- a/vllm_gaudi/models/qwen4_exp.py
++++ b/vllm_gaudi/models/qwen4_exp.py
+@@ -239,24 +239,39 @@ def _save_state(passthrough: torch.Tensor, state: torch.Tensor, indices: torch.T
+ @torch._dynamo.disable
+ def _save_state_prefill(passthrough: torch.Tensor, conv_state: torch.Tensor, tok_state: torch.Tensor,
+                         state_indices: torch.Tensor, hist: torch.Tensor, tokseq: torch.Tensor, qsl: torch.Tensor,
+-                        B: int, conv_state_len: int, ctx_len: int) -> torch.Tensor:
++                        B: int, conv_state_len: int, ctx_len: int, pm: torch.Tensor | None = None,
++                        L: int | None = None) -> torch.Tensor:
+     """Prefill state write done EAGERLY (gather index + index_copy_).
+ 
+     Inside the compiled region the per-request length gather silently used the state-slot index instead of
+     ``qsl`` for every prefill after the first traced one (verified with probes on the real and the tiny
+     model; a standalone replica compiles correctly). All index math is therefore done here, outside compile,
+     from the eagerly resolved metadata.
++
++    Lengths come from ``padding_mask_flat`` when present (real tokens, left-aligned). ``query_start_loc_p``
++    can agree with the padded bucket rather than the unpadded prompt — then the first decode step hashes
++    n-grams against pad ids and short identifier-copy / list prompts collapse. That shows up as a sharp
++    cliff around the smallest prompt bucket / GDN chunk (64).
+     """
+     num_slots = conv_state.shape[0]
+     safe_idx = torch.remainder(state_indices, num_slots).long()
+     valid = state_indices >= 0
+-    qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    seq_len = int(L) if L is not None else int(hist.shape[1] - conv_state_len)
++    if pm is not None and pm.numel() == B * seq_len:
++        qlens = pm.reshape(B, seq_len).sum(dim=1).to(dtype=torch.int64)
++    elif qsl is not None:
++        qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    else:
++        qlens = torch.full((B, ), seq_len, device=hist.device, dtype=torch.int64)
++    qlens = qlens.clamp(min=0, max=seq_len)
+     dev = hist.device
+     offs = torch.arange(conv_state_len, device=dev, dtype=torch.long)
+-    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
++    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).clamp(0, hist.shape[1] - 1)
++    gather_idx = gather_idx.view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
+     new_conv = torch.gather(hist, 1, gather_idx)
+     toffs = torch.arange(ctx_len, device=dev, dtype=torch.long)
+-    new_tok = torch.gather(tokseq, 1, qlens.view(B, 1) + toffs.view(1, -1))
++    tok_idx = (qlens.view(B, 1) + toffs.view(1, -1)).clamp(0, tokseq.shape[1] - 1)
++    new_tok = torch.gather(tokseq, 1, tok_idx)
+     upd = valid & (qlens > 0)
+     new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
+     new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
+@@ -559,7 +574,7 @@ class HpuQwen4ExpPLELayer(nn.Module, MambaBase):
+                 conv_out = conv_out * pm.view(B, L, 1).to(conv_out.dtype)
+             # Always eager: the in-graph length gather used the wrong index (see _save_state_prefill).
+             conv_out = _save_state_prefill(conv_out, conv_state, tok_state, state_indices, hist, tokseq, qsl,
+-                                           B, self.conv_state_len, self.ctx_len)
++                                           B, self.conv_state_len, self.ctx_len, pm, L)
+         elif have_state:
+             new_conv = hist[:, L:L + self.conv_state_len, :]
+             new_tok = tokseq[:, L:L + self.ctx_len]
+diff --git a/vllm_gaudi/models/qwen4_exp_legacy.py b/vllm_gaudi/models/qwen4_exp_legacy.py
+index 9672196..2244d71 100644
+--- a/vllm_gaudi/models/qwen4_exp_legacy.py
++++ b/vllm_gaudi/models/qwen4_exp_legacy.py
+@@ -233,24 +233,39 @@ def _save_state(passthrough: torch.Tensor, state: torch.Tensor, indices: torch.T
+ @torch._dynamo.disable
+ def _save_state_prefill(passthrough: torch.Tensor, conv_state: torch.Tensor, tok_state: torch.Tensor,
+                         state_indices: torch.Tensor, hist: torch.Tensor, tokseq: torch.Tensor, qsl: torch.Tensor,
+-                        B: int, conv_state_len: int, ctx_len: int) -> torch.Tensor:
++                        B: int, conv_state_len: int, ctx_len: int, pm: torch.Tensor | None = None,
++                        L: int | None = None) -> torch.Tensor:
+     """Prefill state write done EAGERLY (gather index + index_copy_).
+ 
+     Inside the compiled region the per-request length gather silently used the state-slot index instead of
+     ``qsl`` for every prefill after the first traced one (verified with probes on the real and the tiny
+     model; a standalone replica compiles correctly). All index math is therefore done here, outside compile,
+     from the eagerly resolved metadata.
++
++    Lengths come from ``padding_mask_flat`` when present (real tokens, left-aligned). ``query_start_loc_p``
++    can agree with the padded bucket rather than the unpadded prompt — then the first decode step hashes
++    n-grams against pad ids and short identifier-copy / list prompts collapse. That shows up as a sharp
++    cliff around the smallest prompt bucket / GDN chunk (64).
+     """
+     num_slots = conv_state.shape[0]
+     safe_idx = torch.remainder(state_indices, num_slots).long()
+     valid = state_indices >= 0
+-    qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    seq_len = int(L) if L is not None else int(hist.shape[1] - conv_state_len)
++    if pm is not None and pm.numel() == B * seq_len:
++        qlens = pm.reshape(B, seq_len).sum(dim=1).to(dtype=torch.int64)
++    elif qsl is not None:
++        qlens = (qsl[1:B + 1] - qsl[:B]).clamp(min=0).long()
++    else:
++        qlens = torch.full((B, ), seq_len, device=hist.device, dtype=torch.int64)
++    qlens = qlens.clamp(min=0, max=seq_len)
+     dev = hist.device
+     offs = torch.arange(conv_state_len, device=dev, dtype=torch.long)
+-    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
++    gather_idx = (qlens.view(B, 1) + offs.view(1, -1)).clamp(0, hist.shape[1] - 1)
++    gather_idx = gather_idx.view(B, conv_state_len, 1).expand(-1, -1, hist.shape[-1])
+     new_conv = torch.gather(hist, 1, gather_idx)
+     toffs = torch.arange(ctx_len, device=dev, dtype=torch.long)
+-    new_tok = torch.gather(tokseq, 1, qlens.view(B, 1) + toffs.view(1, -1))
++    tok_idx = (qlens.view(B, 1) + toffs.view(1, -1)).clamp(0, tokseq.shape[1] - 1)
++    new_tok = torch.gather(tokseq, 1, tok_idx)
+     upd = valid & (qlens > 0)
+     new_conv = torch.where(upd.view(B, 1, 1), new_conv.to(conv_state.dtype), conv_state.index_select(0, safe_idx))
+     new_tok = torch.where(upd.view(B, 1), new_tok.to(tok_state.dtype), tok_state.index_select(0, safe_idx))
+@@ -553,7 +568,7 @@ class HpuQwen4ExpPLELayer(nn.Module, MambaBase):
+                 conv_out = conv_out * pm.view(B, L, 1).to(conv_out.dtype)
+             # Always eager: the in-graph length gather used the wrong index (see _save_state_prefill).
+             conv_out = _save_state_prefill(conv_out, conv_state, tok_state, state_indices, hist, tokseq, qsl,
+-                                           B, self.conv_state_len, self.ctx_len)
++                                           B, self.conv_state_len, self.ctx_len, pm, L)
+         elif have_state:
+             new_conv = hist[:, L:L + self.conv_state_len, :]
+             new_tok = tokseq[:, L:L + self.ctx_len]
+-- 
+2.53.0
+
